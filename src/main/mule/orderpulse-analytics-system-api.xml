@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!-- ============================================================ -->
+    <!-- ANALYTICS SYSTEM API                                         -->
+    <!-- Dedicated connector layer to the Analytics mock service      -->
+    <!-- Handles: event tracking, metrics retrieval, order events     -->
+    <!-- All errors swallowed — analytics never blocks order flow     -->
+    <!-- ============================================================ -->
+
+    <!-- Track a revenue or lifecycle event -->
+    <flow name="analytics-track-event-flow" doc:name="Analytics Track Event">
+
+        <logger
+            level="INFO"
+            message='#["[ANALYTICS SYSTEM API] Tracking event | Type: " ++ (vars.analyticsEventType default "unknown") ++ " | OrderId: " ++ (vars.orderId default "unknown")]'
+            doc:name="Log Track Request"/>
+
+        <http:request
+            method="POST"
+            path="/analytics/track"
+            config-ref="Analytics_Request_Config"
+            doc:name="POST Track Event">
+            <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId default "unknown",
+    customerId: vars.customerId default "unknown",
+    customerTier: vars.customerTier default "STANDARD",
+    sku: vars.orderSku default "unknown",
+    quantity: vars.orderQuantity default 0,
+    orderValue: vars.orderValue default 0,
+    eventType: vars.analyticsEventType default "ORDER_EVENT",
+    channel: "MULESOFT_INTEGRATION",
+    metadata: {
+        routingPath: vars.routingPath default "unknown",
+        processingPriority: vars.processingPriority default "STANDARD",
+        correlationId: vars.correlationId default "unknown"
+    }
+}]</http:body>
+            <http:headers>#[{
+                "x-correlation-id": vars.correlationId default "unknown",
+                "x-source-system": "orderpulse-analytics-system-api",
+                "x-request-timestamp": now() as String
+            }]</http:headers>
+        </http:request>
+
+        <logger
+            level="INFO"
+            message='#["[ANALYTICS SYSTEM API] Event tracked | EventId: " ++ (payload.data.eventId default "unknown")]'
+            doc:name="Log Event Tracked"/>
+
+        <error-handler>
+            <!-- Always continue — analytics never blocks order processing -->
+            <on-error-continue type="ANY" doc:name="Analytics Track Error">
+                <logger
+                    level="WARN"
+                    message='#["[ANALYTICS SYSTEM API] Event tracking failed — continuing | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log Analytics Error"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+    <!-- Get real-time metrics -->
+    <flow name="analytics-get-metrics-flow" doc:name="Analytics Get Metrics">
+
+        <logger
+            level="INFO"
+            message="#['[ANALYTICS SYSTEM API] Fetching real-time metrics']"
+            doc:name="Log Metrics Request"/>
+
+        <http:request
+            method="GET"
+            path="/analytics/metrics"
+            config-ref="Analytics_Request_Config"
+            doc:name="GET Metrics">
+            <http:headers>#[{
+                "x-correlation-id": vars.correlationId default uuid(),
+                "x-source-system": "orderpulse-analytics-system-api"
+            }]</http:headers>
+        </http:request>
+
+        <logger
+            level="INFO"
+            message='#["[ANALYTICS SYSTEM API] Metrics retrieved | Total Orders: " ++ (payload.data.realtime.totalOrders default 0 as String) ++ " | Revenue: $" ++ (payload.data.realtime.totalRevenue default 0 as String)]'
+            doc:name="Log Metrics Retrieved"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Analytics Metrics Error">
+                <logger
+                    level="WARN"
+                    message="#['[ANALYTICS SYSTEM API] Metrics unavailable — returning defaults']"
+                    doc:name="Log Metrics Error"/>
+                <set-payload
+                    value='#[{
+                        data: {
+                            realtime: {
+                                totalRevenue: 0,
+                                totalOrders: 0,
+                                successRate: 100,
+                                recoveryRate: 100
+                            }
+                        }
+                    }]'
+                    doc:name="Default Metrics Response"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+    <!-- Get events for a specific order -->
+    <flow name="analytics-get-order-events-flow" doc:name="Analytics Get Order Events">
+
+        <logger
+            level="INFO"
+            message='#["[ANALYTICS SYSTEM API] Fetching order events | OrderId: " ++ (vars.orderId default "unknown")]'
+            doc:name="Log Events Request"/>
+
+<http:request
+    method="GET"
+    path="/analytics/events/{orderId}"
+    config-ref="Analytics_Request_Config"
+    doc:name="GET Order Events">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-analytics-system-api"
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        orderId: vars.orderId 
+    }]</http:uri-params>
+</http:request>
+
+        <logger
+            level="INFO"
+            message='#["[ANALYTICS SYSTEM API] Events retrieved | OrderId: " ++ (vars.orderId default "unknown") ++ " | Count: " ++ (payload.data.eventCount default 0 as String)]'
+            doc:name="Log Events Retrieved"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Analytics Events Error">
+                <logger
+                    level="WARN"
+                    message='#["[ANALYTICS SYSTEM API] Order events unavailable | OrderId: " ++ (vars.orderId default "unknown")]'
+                    doc:name="Log Events Error"/>
+                <set-payload
+                    value='#[{ data: { eventCount: 0, events: [] } }]'
+                    doc:name="Default Events Response"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+</mule>

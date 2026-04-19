@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!-- ============================================================ -->
+    <!-- CRM SYSTEM API                                               -->
+    <!-- Dedicated connector layer to the CRM mock service            -->
+    <!-- Handles: customer lookup, order update, history retrieval    -->
+    <!-- ============================================================ -->
+
+    <!-- Fetch customer profile by ID -->
+    <flow name="crm-get-customer-flow" doc:name="CRM Get Customer">
+
+        <logger
+            level="INFO"
+            message='#["[CRM SYSTEM API] Fetching customer | CustomerId: " ++ (vars.customerId default "unknown") ++ " | CorrelationId: " ++ (vars.correlationId default "unknown")]'
+            doc:name="Log Customer Fetch"/>
+
+<http:request
+    method="GET"
+    path="/customers/{customerId}"
+    config-ref="CRM_Request_Config"
+    doc:name="GET Customer">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-crm-system-api",
+        "x-request-timestamp": now() as String
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        customerId: vars.customerId 
+    }]</http:uri-params>
+</http:request>
+
+        <logger
+            level="INFO"
+            message='#["[CRM SYSTEM API] Customer retrieved | Name: " ++ (payload.data.name default "unknown") ++ " | Tier: " ++ (payload.data.tier default "unknown")]'
+            doc:name="Log Customer Retrieved"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="CRM Get Customer Error">
+                <logger
+                    level="ERROR"
+                    message='#["[CRM SYSTEM API] Customer fetch failed | CustomerId: " ++ (vars.customerId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log CRM Fetch Error"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <!-- Update customer record after order -->
+    <flow name="crm-update-customer-flow" doc:name="CRM Update Customer">
+
+        <logger
+            level="INFO"
+            message='#["[CRM SYSTEM API] Updating customer record | CustomerId: " ++ (vars.customerId default "unknown") ++ " | OrderId: " ++ (vars.orderId default "unknown")]'
+            doc:name="Log Customer Update"/>
+
+<http:request
+    method="POST"
+    path="/customers/{customerId}/order-update"
+    config-ref="CRM_Request_Config"
+    doc:name="POST Customer Order Update">
+    
+        <http:body>#[%dw 2.0
+        output application/json
+        ---
+        {
+            orderId: vars.orderId,
+            orderValue: vars.orderValue,
+            sku: vars.orderSku
+        }]</http:body>
+    
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-crm-system-api",
+        "x-request-timestamp": now() as String
+    }]</http:headers>
+
+    <http:uri-params>#[{ 
+        customerId: vars.customerId 
+    }]</http:uri-params>
+
+
+        
+</http:request>
+
+        <logger
+            level="INFO"
+            message='#["[CRM SYSTEM API] Customer updated | CustomerId: " ++ (vars.customerId default "unknown") ++ " | Journey: " ++ (payload.data.journeyTriggered default "none")]'
+            doc:name="Log Customer Updated"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="CRM Update Error">
+                <logger
+                    level="ERROR"
+                    message='#["[CRM SYSTEM API] Customer update failed | CustomerId: " ++ (vars.customerId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log CRM Update Error"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <!-- Get customer order history -->
+    <flow name="crm-get-customer-history-flow" doc:name="CRM Get Customer History">
+
+        <logger
+            level="INFO"
+            message='#["[CRM SYSTEM API] Fetching customer history | CustomerId: " ++ (vars.customerId default "unknown")]'
+            doc:name="Log History Request"/>
+
+<http:request
+    method="GET"
+    path="/customers/{customerId}/history"
+    config-ref="CRM_Request_Config"
+    doc:name="GET Customer History">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-crm-system-api"
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        customerId: vars.customerId 
+    }]</http:uri-params>
+</http:request>
+
+        <logger
+            level="INFO"
+            message='#["[CRM SYSTEM API] History retrieved | CustomerId: " ++ (vars.customerId default "unknown") ++ " | Total Orders: " ++ (payload.data.totalOrders default 0 as String)]'
+            doc:name="Log History Retrieved"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="CRM History Error">
+                <logger
+                    level="WARN"
+                    message='#["[CRM SYSTEM API] History unavailable | CustomerId: " ++ (vars.customerId default "unknown")]'
+                    doc:name="Log History Error"/>
+                <set-payload
+                    value='#[{ data: { totalOrders: 0, recentOrders: [] } }]'
+                    doc:name="Default History Response"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+</mule>

@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:tls="http://www.mulesoft.org/schema/mule/tls"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/amqp
+        http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd
+        http://www.mulesoft.org/schema/mule/os
+        http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/tls
+        http://www.mulesoft.org/schema/mule/tls/current/mule-tls.xsd">
+
+    <!-- ============================================================ -->
+    <!-- ENVIRONMENT CONFIGURATION                                      -->
+    <!-- Loads properties from the appropriate environment YAML file   -->
+    <!-- Switch mule.env to switch between dev/uat/prod               -->
+    <!-- ============================================================ -->
+    <configuration-properties
+        file="config/dev.yaml"
+        doc:name="Environment Configuration"/>
+
+    <!-- ============================================================ -->
+    <!-- HTTP LISTENER CONFIG                                          -->
+    <!-- The public-facing Experience API listener                    -->
+    <!-- All inbound order requests hit this config first             -->
+    <!-- ============================================================ -->
+    <http:listener-config
+        name="HTTP_Listener_Config"
+        doc:name="HTTP Listener Config">
+        <http:listener-connection
+            host="0.0.0.0"
+            port="${http.port}"/>
+    </http:listener-config>
+
+    <!-- ============================================================ -->
+    <!-- HTTP REQUEST CONFIGS — SYSTEM APIS                           -->
+    <!-- One config per downstream mock service                       -->
+    <!-- Timeout values pulled from environment YAML                  -->
+    <!-- ============================================================ -->
+
+    <!-- ERP Service -->
+    <http:request-config
+        name="ERP_Request_Config"
+        doc:name="ERP HTTP Request Config"
+        basePath="${services.erp.basePath}">
+        <http:request-connection
+            host="${services.erp.host}"
+            port="${services.erp.port}"
+            connectionIdleTimeout="${services.erp.timeout}"/>
+    </http:request-config>
+
+    <!-- CRM Service -->
+    <http:request-config
+        name="CRM_Request_Config"
+        doc:name="CRM HTTP Request Config"
+        basePath="${services.crm.basePath}">
+        <http:request-connection
+            host="${services.crm.host}"
+            port="${services.crm.port}"
+            connectionIdleTimeout="${services.crm.timeout}"/>
+    </http:request-config>
+
+    <!-- Warehouse Service -->
+    <http:request-config
+        name="Warehouse_Request_Config"
+        doc:name="Warehouse HTTP Request Config"
+        basePath="${services.warehouse.basePath}">
+        <http:request-connection
+            host="${services.warehouse.host}"
+            port="${services.warehouse.port}"
+            connectionIdleTimeout="${services.warehouse.timeout}"/>
+    </http:request-config>
+
+    <!-- Analytics Service -->
+    <http:request-config
+        name="Analytics_Request_Config"
+        doc:name="Analytics HTTP Request Config"
+        basePath="${services.analytics.basePath}">
+        <http:request-connection
+            host="${services.analytics.host}"
+            port="${services.analytics.port}"
+            connectionIdleTimeout="${services.analytics.timeout}"/>
+    </http:request-config>
+
+    <!-- ============================================================ -->
+    <!-- AMQP CONFIG — RABBITMQ CONNECTION                            -->
+    <!-- Connects to RabbitMQ via AMQP 0.9.1 protocol                -->
+    <!-- In production this points to Anypoint MQ or enterprise broker-->
+    <!-- ============================================================ -->
+    <amqp:config
+        name="AMQP_Config"
+        doc:name="AMQP Config">
+        <amqp:connection
+            host="${rabbitmq.host}"
+            port="${rabbitmq.port}"
+            username="${rabbitmq.username}"
+            password="${rabbitmq.password}"
+            virtualHost="${rabbitmq.virtualHost}"/>
+    </amqp:config>
+
+    <!-- ============================================================ -->
+    <!-- OBJECT STORE CONFIG — IDEMPOTENCY KEY STORAGE                -->
+    <!-- Stores processed order IDs to prevent duplicate processing   -->
+    <!-- TTL of 24 hours — orders older than this can reprocess       -->
+    <!-- ============================================================ -->
+    <os:object-store
+        name="Idempotency_Store"
+        doc:name="Idempotency Object Store"
+        maxEntries="10000"
+        entryTtl="86400"
+        entryTtlUnit="SECONDS"
+        persistent="true"/>
+
+    <!-- ============================================================ -->
+    <!-- OBJECT STORE CONFIG — CIRCUIT BREAKER STATE                  -->
+    <!-- Tracks failure counts per downstream service                 -->
+    <!-- Used by circuit breaker logic in process API                 -->
+    <!-- ============================================================ -->
+    <os:object-store
+        name="Circuit_Breaker_Store"
+        doc:name="Circuit Breaker State Store"
+        maxEntries="100"
+        entryTtl="3600"
+        entryTtlUnit="SECONDS"
+        persistent="false"/>
+
+    <!-- ============================================================ -->
+    <!-- GLOBAL ERROR HANDLER                                         -->
+    <!-- Catches all unhandled errors across every flow               -->
+    <!-- Returns structured error response with correlation ID        -->
+    <!-- ============================================================ -->
+    <error-handler name="Global_Error_Handler" doc:name="Global Error Handler">
+
+        <!-- Validation errors — bad payload from client -->
+        <on-error-propagate
+            type="VALIDATION:VALIDATION, MULE:EXPRESSION"
+            doc:name="Validation Error" enableNotifications="true" logException="true">
+            <set-variable
+                variableName="httpStatus"
+                value="400"
+                doc:name="Set 400 Status"/>
+            <set-payload
+                value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "VALIDATION_ERROR",
+        message: error.description,
+        code: 400
+    }
+}]'
+                doc:name="Validation Error Response"
+                mimeType="application/json"/>
+        </on-error-propagate>
+
+        <!-- Connectivity errors — downstream service unreachable -->
+        <on-error-propagate
+            type="HTTP:CONNECTIVITY,HTTP:TIMEOUT"
+            doc:name="Connectivity Error">
+            <set-variable
+                variableName="httpStatus"
+                value="503"
+                doc:name="Set 503 Status"/>
+            <set-payload
+                value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "SERVICE_UNAVAILABLE",
+        message: "A downstream service is temporarily unavailable. Your order has been queued for retry.",
+        code: 503,
+        retryable: true
+    }
+}]'
+                doc:name="Connectivity Error Response"
+                mimeType="application/json"/>
+        </on-error-propagate>
+
+        <!-- Security errors — unauthorized requests -->
+        <on-error-propagate
+            type="HTTP:UNAUTHORIZED,HTTP:FORBIDDEN"
+            doc:name="Security Error">
+            <set-variable
+                variableName="httpStatus"
+                value="401"
+                doc:name="Set 401 Status"/>
+            <set-payload
+                value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "UNAUTHORIZED",
+        message: "Request unauthorized. Valid API key required.",
+        code: 401,
+        retryable: false
+    }
+}]'
+                doc:name="Security Error Response"
+                mimeType="application/json"/>
+        </on-error-propagate>
+
+        <!-- Catch-all — any unhandled error -->
+        <on-error-propagate
+            type="ANY"
+            doc:name="Generic Error">
+            <set-variable
+                variableName="httpStatus"
+                value="500"
+                doc:name="Set 500 Status"/>
+            <set-payload
+                value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "INTERNAL_ERROR",
+        message: "An unexpected error occurred. Our team has been notified.",
+        code: 500,
+        retryable: false
+    }
+}]'
+                doc:name="Generic Error Response"
+                mimeType="application/json"/>
+        </on-error-propagate>
+
+    </error-handler>
+
+</mule>

@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!-- ============================================================ -->
+    <!-- ERP SYSTEM API                                               -->
+    <!-- Dedicated connector layer to the ERP mock service            -->
+    <!-- Handles: inventory check, reserve, release, fulfillment      -->
+    <!-- All calls include correlation ID and source system headers    -->
+    <!-- ============================================================ -->
+
+    <!-- Check inventory availability for a SKU -->
+    <flow name="erp-check-inventory-flow" doc:name="ERP Check Inventory">
+
+        <logger
+            level="INFO"
+            message='#["[ERP SYSTEM API] Checking inventory | SKU: " ++ (vars.orderSku default "unknown") ++ " | CorrelationId: " ++ (vars.correlationId default "unknown")]'
+            doc:name="Log Inventory Check"/>
+
+<http:request
+    method="GET"
+    path="/inventory/check/{sku}"
+    config-ref="ERP_Request_Config"
+    doc:name="GET Inventory Check">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-erp-system-api",
+        "x-request-timestamp": now() as String
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        sku: vars.orderSku 
+    }]</http:uri-params>
+</http:request>
+
+        <logger
+            level="INFO"
+            message='#["[ERP SYSTEM API] Inventory check response | Available: " ++ (payload.data.available default 0 as String) ++ " | InStock: " ++ (payload.data.inStock default false as String)]'
+            doc:name="Log Inventory Response"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="ERP Inventory Check Error">
+                <logger
+                    level="ERROR"
+                    message='#["[ERP SYSTEM API] Inventory check failed | SKU: " ++ (vars.orderSku default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log ERP Check Error"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <!-- Reserve inventory for an order -->
+    <flow name="erp-reserve-inventory-flow" doc:name="ERP Reserve Inventory">
+
+        <logger
+            level="INFO"
+            message='#["[ERP SYSTEM API] Reserving inventory | OrderId: " ++ (vars.orderId default "unknown") ++ " | SKU: " ++ (vars.orderSku default "unknown") ++ " | Qty: " ++ (vars.orderQuantity default 0 as String)]'
+            doc:name="Log Reserve Request"/>
+
+        <http:request
+            method="POST"
+            path="/inventory/reserve"
+            config-ref="ERP_Request_Config"
+            doc:name="POST Reserve Inventory">
+            <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    sku: vars.orderSku,
+    quantity: vars.orderQuantity,
+    customerId: vars.customerId
+}]</http:body>
+            <http:headers>#[{
+                "x-correlation-id": vars.correlationId default "unknown",
+                "x-source-system": "orderpulse-erp-system-api",
+                "x-request-timestamp": now() as String
+            }]</http:headers>
+        </http:request>
+
+        <logger
+            level="INFO"
+            message='#["[ERP SYSTEM API] Inventory reserved | ReservationId: " ++ (payload.data.reservationId default "unknown") ++ " | Value: $" ++ (payload.data.totalValue default "0" as String)]'
+            doc:name="Log Reserve Response"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="ERP Reserve Error">
+                <logger
+                    level="ERROR"
+                    message='#["[ERP SYSTEM API] Inventory reservation failed | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log ERP Reserve Error"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <!-- Release inventory reservation — saga compensation -->
+    <flow name="erp-release-inventory-flow" doc:name="ERP Release Inventory">
+
+        <logger
+            level="WARN"
+            message='#["[ERP SYSTEM API] Releasing inventory reservation | OrderId: " ++ (vars.orderId default "unknown") ++ " | ReservationId: " ++ (vars.erpReservationId default "unknown")]'
+            doc:name="Log Release Request"/>
+
+        <http:request
+            method="POST"
+            path="/inventory/release"
+            config-ref="ERP_Request_Config"
+            doc:name="POST Release Inventory">
+            <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    sku: vars.orderSku,
+    quantity: vars.orderQuantity,
+    reservationId: vars.erpReservationId
+}]</http:body>
+            <http:headers>#[{
+                "x-correlation-id": vars.correlationId default "unknown",
+                "x-source-system": "orderpulse-erp-system-api",
+                "x-saga-compensation": "true"
+            }]</http:headers>
+        </http:request>
+
+        <logger
+            level="INFO"
+            message='#["[ERP SYSTEM API] Inventory released | OrderId: " ++ (vars.orderId default "unknown") ++ " | Status: SAGA_COMPENSATED"]'
+            doc:name="Log Release Response"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="ERP Release Error">
+                <logger
+                    level="ERROR"
+                    message='#["[ERP SYSTEM API] Inventory release failed — manual intervention may be required | OrderId: " ++ (vars.orderId default "unknown")]'
+                    doc:name="Log ERP Release Error"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+    <!-- Trigger fulfillment for a reserved order -->
+    <flow name="erp-trigger-fulfillment-flow" doc:name="ERP Trigger Fulfillment">
+
+        <logger
+            level="INFO"
+            message='#["[ERP SYSTEM API] Triggering fulfillment | OrderId: " ++ (vars.orderId default "unknown")]'
+            doc:name="Log Fulfillment Request"/>
+
+        <http:request
+            method="POST"
+            path="/fulfillment/trigger"
+            config-ref="ERP_Request_Config"
+            doc:name="POST Trigger Fulfillment">
+            <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    sku: vars.orderSku,
+    quantity: vars.orderQuantity,
+    customerId: vars.customerId,
+    shippingAddress: vars.shippingAddress default null
+}]</http:body>
+            <http:headers>#[{
+                "x-correlation-id": vars.correlationId default "unknown",
+                "x-source-system": "orderpulse-erp-system-api",
+                "x-request-timestamp": now() as String
+            }]</http:headers>
+        </http:request>
+
+        <logger
+            level="INFO"
+            message='#["[ERP SYSTEM API] Fulfillment triggered | FulfillmentId: " ++ (payload.data.fulfillmentId default "unknown")]'
+            doc:name="Log Fulfillment Response"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="ERP Fulfillment Error">
+                <logger
+                    level="ERROR"
+                    message='#["[ERP SYSTEM API] Fulfillment trigger failed | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log ERP Fulfillment Error"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <!-- Get fulfillment status for an order -->
+    <flow name="erp-get-fulfillment-status-flow" doc:name="ERP Get Fulfillment Status">
+
+        <logger
+            level="INFO"
+            message='#["[ERP SYSTEM API] Fetching fulfillment status | OrderId: " ++ (vars.orderId default "unknown")]'
+            doc:name="Log Status Request"/>
+
+<http:request
+    method="GET"
+    path="/fulfillment/status/{orderId}"
+    config-ref="ERP_Request_Config"
+    doc:name="GET Fulfillment Status">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-erp-system-api"
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        orderId: vars.orderId 
+    }]</http:uri-params>
+</http:request>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="ERP Status Error">
+                <logger
+                    level="WARN"
+                    message='#["[ERP SYSTEM API] Fulfillment status unavailable | OrderId: " ++ (vars.orderId default "unknown")]'
+                    doc:name="Log ERP Status Error"/>
+                <set-payload
+                    value='#[{ data: { status: "UNKNOWN", message: "ERP status temporarily unavailable" } }]'
+                    doc:name="Default Status Response"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+</mule>

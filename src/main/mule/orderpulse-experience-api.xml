@@ -1,0 +1,526 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os
+        http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <flow name="post-order-experience-flow" doc:name="POST /api/v1/orders">
+
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="${http.basePath}/orders"
+            allowedMethods="POST"
+            doc:name="POST /orders">
+            <http:response statusCode="#[vars.httpStatus default 202]">
+                <http:headers>#[{
+                    'Content-Type': 'application/json',
+                    'x-correlation-id': vars.correlationId default '',
+                    'x-request-id': vars.orderId default ''
+                }]</http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:headers>#[{
+                    'Content-Type': 'application/json',
+                    'x-correlation-id': vars.correlationId default ''
+                }]</http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <set-variable
+            variableName="correlationId"
+            value="#[correlationId default uuid()]"
+            doc:name="Set Correlation ID"/>
+
+        <logger
+            level="INFO"
+            message="#['[EXPERIENCE API] Incoming order request | CorrelationId: ' ++ (vars.correlationId default 'unknown')]"
+            doc:name="Log Incoming Request"/>
+
+        <choice doc:name="Valid Content Type?">
+            <when expression="#[attributes.headers.'content-type' startsWith 'application/json']">
+
+                <try doc:name="Try Parse Payload">
+                    <set-variable
+                        variableName="incomingPayload"
+                        value="#[payload]"
+                        doc:name="Store Incoming Payload"/>
+                    <error-handler>
+                        <on-error-propagate type="ANY" doc:name="Parse Error">
+                            <set-variable
+                                variableName="httpStatus"
+                                value="400"
+                                doc:name="Set 400"/>
+                            <set-payload
+                                value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "INVALID_JSON",
+        message: "Request body must be valid JSON",
+        code: 400
+    }
+}]'
+                                doc:name="Invalid JSON Response"
+                                mimeType="application/json"/>
+                        </on-error-propagate>
+                    </error-handler>
+                </try>
+
+                <!-- Work from vars.incomingPayload from here — never touch payload again -->
+                <choice doc:name="Required Fields Present?">
+                    <when expression="#[vars.incomingPayload.customerId != null and vars.incomingPayload.sku != null and vars.incomingPayload.quantity != null and vars.incomingPayload.orderType != null]">
+
+                        <choice doc:name="Valid Order Type?">
+                            <when expression="#[vars.incomingPayload.orderType == 'STANDARD' or vars.incomingPayload.orderType == 'EXPRESS' or vars.incomingPayload.orderType == 'INTERNATIONAL']">
+
+                                <choice doc:name="Valid Quantity?">
+                                    <when expression="#[vars.incomingPayload.quantity &gt;= 1 and vars.incomingPayload.quantity &lt;= 100]">
+
+                                        <set-variable
+                                            variableName="orderId"
+                                            value="#['ORD-' ++ upper(uuid()[0 to 7])]"
+                                            doc:name="Generate Order ID"/>
+
+                                        <set-variable
+                                            variableName="customerId"
+                                            value="#[vars.incomingPayload.customerId]"
+                                            doc:name="Store Customer ID"/>
+
+                                        <set-variable
+                                            variableName="orderSku"
+                                            value="#[vars.incomingPayload.sku]"
+                                            doc:name="Store SKU"/>
+
+                                        <set-variable
+                                            variableName="orderQuantity"
+                                            value="#[vars.incomingPayload.quantity]"
+                                            doc:name="Store Quantity"/>
+
+                                        <set-variable
+                                            variableName="orderType"
+                                            value="#[vars.incomingPayload.orderType]"
+                                            doc:name="Store Order Type"/>
+
+                                        <set-variable
+                                            variableName="idempotencyKey"
+                                            value="#[%dw 2.0
+output application/java
+---
+vars.customerId ++ '-' ++ vars.orderSku ++ '-' ++ (vars.incomingPayload.idempotencyKey default vars.orderId)]"
+                                            doc:name="Build Idempotency Key"/>
+
+                                        <!-- Store result in variable — never let it overwrite payload -->
+                                        <os:contains
+                                            key="#[vars.idempotencyKey]"
+                                            objectStore="Idempotency_Store"
+                                            doc:name="Check Idempotency Store"
+                                            target="isDuplicate"/>
+
+                                        <choice doc:name="Duplicate Request?">
+                                            <when expression="#[vars.isDuplicate == true]">
+
+                                                <logger
+                                                    level="WARN"
+                                                    message="#['[EXPERIENCE API] Duplicate order detected | Key: ' ++ (vars.idempotencyKey default 'unknown')]"
+                                                    doc:name="Log Duplicate"/>
+
+                                                <set-variable
+                                                    variableName="httpStatus"
+                                                    value="200"
+                                                    doc:name="Set 200 for Duplicate"/>
+
+                                                <set-payload
+                                                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: true,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    orderId: vars.orderId default "unknown",
+    status: "DUPLICATE_DETECTED",
+    message: "This order has already been received and is being processed. No duplicate created.",
+    idempotencyKey: vars.idempotencyKey default "unknown"
+}]'
+                                                    doc:name="Duplicate Response"
+                                                    mimeType="application/json"/>
+
+                                            </when>
+                                            <otherwise>
+
+                                                <os:store
+                                                    key="#[vars.idempotencyKey]"
+                                                    objectStore="Idempotency_Store"
+                                                    doc:name="Store Idempotency Key">
+                                                    <os:value>#[%dw 2.0
+output application/java
+---
+{
+    orderId: vars.orderId,
+    receivedAt: now() as String,
+    correlationId: vars.correlationId
+}]</os:value>
+                                                </os:store>
+
+                                                <logger
+                                                    level="INFO"
+                                                    message="#[%dw 2.0
+output application/java
+---
+'[EXPERIENCE API] New order validated | OrderId: ' ++ (vars.orderId default 'unknown')
+++ ' | Customer: ' ++ (vars.customerId default 'unknown')
+++ ' | SKU: ' ++ (vars.orderSku default 'unknown')
+++ ' | Type: ' ++ (vars.orderType default 'unknown')]"
+                                                    doc:name="Log Validated Order"/>
+
+                                                <flow-ref
+                                                    name="process-order-flow"
+                                                    doc:name="Route to Process API"/>
+
+                                            </otherwise>
+                                        </choice>
+
+                                    </when>
+                                    <otherwise>
+                                        <set-variable
+                                            variableName="httpStatus"
+                                            value="400"
+                                            doc:name="Set 400"/>
+                                        <set-payload
+                                            value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "VALIDATION_ERROR",
+        message: "quantity must be between 1 and 100",
+        field: "quantity",
+        code: 400
+    }
+}]'
+                                            doc:name="Invalid Quantity Response"
+                                            mimeType="application/json"/>
+                                    </otherwise>
+                                </choice>
+
+                            </when>
+                            <otherwise>
+                                <set-variable
+                                    variableName="httpStatus"
+                                    value="400"
+                                    doc:name="Set 400"/>
+                                <set-payload
+                                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "VALIDATION_ERROR",
+        message: "orderType must be STANDARD, EXPRESS, or INTERNATIONAL",
+        field: "orderType",
+        allowed: ["STANDARD", "EXPRESS", "INTERNATIONAL"],
+        code: 400
+    }
+}]'
+                                    doc:name="Invalid Order Type Response"
+                                    mimeType="application/json"/>
+                            </otherwise>
+                        </choice>
+
+                    </when>
+                    <otherwise>
+                        <set-variable
+                            variableName="httpStatus"
+                            value="400"
+                            doc:name="Set 400"/>
+                        <set-payload
+                            value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "VALIDATION_ERROR",
+        message: "Missing required fields",
+        required: ["customerId", "sku", "quantity", "orderType"],
+        code: 400
+    }
+}]'
+                            doc:name="Missing Fields Response"
+                            mimeType="application/json"/>
+                    </otherwise>
+                </choice>
+
+            </when>
+            <otherwise>
+                <set-variable
+                    variableName="httpStatus"
+                    value="415"
+                    doc:name="Set 415"/>
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "UNSUPPORTED_MEDIA_TYPE",
+        message: "Content-Type must be application/json",
+        code: 415
+    }
+}]'
+                    doc:name="Wrong Content Type Response"
+                    mimeType="application/json"/>
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="Experience API Error">
+                <logger
+                    level="ERROR"
+                    message="#['[EXPERIENCE API] Unhandled error | CorrelationId: ' ++ (vars.correlationId default 'unknown') ++ ' | Error: ' ++ error.description]"
+                    doc:name="Log Unhandled Error"/>
+                <set-variable
+                    variableName="httpStatus"
+                    value="500"
+                    doc:name="Set 500"/>
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "INTERNAL_ERROR",
+        message: "An unexpected error occurred",
+        code: 500
+    }
+}]'
+                    doc:name="Internal Error Response"
+                    mimeType="application/json"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <flow name="get-order-status-experience-flow" doc:name="GET /api/v1/orders/{orderId}">
+
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="${http.basePath}/orders/{orderId}"
+            allowedMethods="GET"
+            doc:name="GET /orders/{orderId}">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers>#[{
+                    'Content-Type': 'application/json',
+                    'x-correlation-id': vars.correlationId default ''
+                }]</http:headers>
+            </http:response>
+        </http:listener>
+
+        <set-variable
+            variableName="correlationId"
+            value="#[correlationId default uuid()]"
+            doc:name="Set Correlation ID"/>
+
+        <set-variable
+            variableName="orderId"
+            value="#[attributes.uriParams.orderId]"
+            doc:name="Extract Order ID"/>
+
+        <logger
+            level="INFO"
+            message="#['[EXPERIENCE API] Order status request | OrderId: ' ++ (vars.orderId default 'unknown')]"
+            doc:name="Log Status Request"/>
+
+        <flow-ref
+            name="get-order-status-flow"
+            doc:name="Get Order Status"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="Status Error">
+                <set-variable
+                    variableName="httpStatus"
+                    value="500"
+                    doc:name="Set 500"/>
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "INTERNAL_ERROR",
+        message: "Failed to retrieve order status",
+        code: 500
+    }
+}]'
+                    doc:name="Status Error Response"
+                    mimeType="application/json"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <flow name="health-check-flow" doc:name="GET /api/v1/health">
+
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="${http.basePath}/health"
+            allowedMethods="GET"
+            doc:name="GET /health"/>
+
+        <set-payload
+            value='#[%dw 2.0
+output application/json
+---
+{
+    service: "OrderPulse Integration API",
+    status: "OPERATIONAL",
+    version: "1.0.0",
+    timestamp: now() as String,
+    environment: "dev",
+    endpoints: [
+        { method: "POST", path: "/api/v1/orders", description: "Submit a new order" },
+        { method: "GET",  path: "/api/v1/orders/{orderId}", description: "Get order status" },
+        { method: "GET",  path: "/api/v1/health", description: "Health check" },
+        { method: "GET",  path: "/api/v1/metrics", description: "Integration metrics" }
+    ]
+}]'
+            doc:name="Health Response"
+            mimeType="application/json"/>
+
+    </flow>
+
+    <flow name="get-metrics-flow" doc:name="GET /api/v1/metrics">
+
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="${http.basePath}/metrics"
+            allowedMethods="GET"
+            doc:name="GET /metrics"/>
+
+        <set-variable
+            variableName="correlationId"
+            value="#[uuid()]"
+            doc:name="Set Correlation ID"/>
+
+        <http:request
+            method="GET"
+            path="/analytics/metrics"
+            config-ref="Analytics_Request_Config"
+            doc:name="Fetch Analytics Metrics"/>
+
+        <set-variable
+            variableName="analyticsMetrics"
+            value="#[payload]"
+            doc:name="Store Analytics Metrics"/>
+
+        <set-payload
+            value='#[%dw 2.0
+output application/json
+---
+{
+    service: "OrderPulse Integration API",
+    timestamp: now() as String,
+    integration: {
+        status: "OPERATIONAL",
+        environment: "dev",
+        deployment: "CloudHub 2.0"
+    },
+    analytics: vars.analyticsMetrics.data default {}
+}]'
+            doc:name="Metrics Response"
+            mimeType="application/json"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Metrics Error">
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    service: "OrderPulse Integration API",
+    timestamp: now() as String,
+    integration: {
+        status: "OPERATIONAL",
+        environment: "dev"
+    },
+    analytics: { message: "Analytics service temporarily unavailable" }
+}]'
+                    doc:name="Metrics Fallback Response"
+                    mimeType="application/json"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- CIRCUIT BREAKER RESET                                        -->
+    <!-- ============================================================ -->
+    <flow name="reset-circuit-breaker-flow" doc:name="Reset Circuit Breaker">
+
+        <http:listener
+            config-ref="HTTP_Listener_Config"
+            path="${http.basePath}/circuit-breaker/{service}/reset"
+            allowedMethods="POST"
+            doc:name="POST /circuit-breaker/{service}/reset"/>
+
+        <set-variable
+            variableName="targetService"
+            value="#[attributes.uriParams.service]"
+            doc:name="Extract Service Name"/>
+
+        <logger
+            level="INFO"
+            message="#['[CIRCUIT BREAKER] Manual reset requested for service: ' ++ (vars.targetService default 'unknown')]"
+            doc:name="Log Reset Request"/>
+
+        <flow-ref
+            name="circuit-breaker-reset-flow"
+            doc:name="Reset Circuit Breaker"/>
+
+        <set-payload
+            value='#[%dw 2.0
+output application/json
+---
+{
+    success: true,
+    timestamp: now() as String,
+    message: "Circuit breaker reset successfully for service: " ++ (vars.targetService default "unknown"),
+    service: vars.targetService default "unknown",
+    state: "CLOSED"
+}]'
+            doc:name="Reset Response"
+            mimeType="application/json"/>
+
+    </flow>
+
+</mule>

@@ -1,0 +1,386 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/amqp
+        http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd
+        http://www.mulesoft.org/schema/mule/os
+        http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <!-- ============================================================ -->
+    <!-- RETRY WITH EXPONENTIAL BACKOFF FLOW                          -->
+    <!-- ============================================================ -->
+    <flow name="retry-with-backoff-flow" doc:name="Retry With Exponential Backoff">
+
+        <logger
+            level="WARN"
+            message='#["[RETRY] Order: " ++ (vars.correlationId default "unknown") ++ " | Attempt: " ++ (vars.retryCount default 0 as String) ++ " | Service: " ++ (vars.failedService default "unknown")]'
+            doc:name="Log Retry Attempt"/>
+
+        <choice doc:name="Max Retries Reached?">
+            <when expression="#[(vars.retryCount default 0) >= 3]">
+
+                <logger
+                    level="ERROR"
+                    message='#["[DLQ] Max retries exceeded for order: " ++ (vars.correlationId default "unknown")]'
+                    doc:name="Log DLQ Routing"/>
+
+<amqp:publish
+    config-ref="AMQP_Config"
+    exchangeName="orderpulse.dlx"
+    doc:name="Publish to Dead Letter Queue">
+    <amqp:routing-keys >
+						<amqp:routing-key value="${rabbitmq.queues.deadLetter}" />
+					</amqp:routing-keys>
+					<amqp:message>
+        <amqp:body><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+    correlationId: vars.correlationId default "unknown",
+    orderId: vars.orderId default "unknown",
+    customerId: vars.customerId default "unknown",
+    customerTier: vars.customerTier default "STANDARD",
+    sku: vars.orderSku default "unknown",
+    quantity: vars.orderQuantity default 0,
+    orderValue: vars.orderValue default 0,
+    originalPayload: vars.originalPayload default {},
+    failedService: vars.failedService default "unknown",
+    retryCount: vars.retryCount default 0,
+    lastError: vars.lastError default "unknown",
+    failedAt: now() as String,
+    `type`: "DEAD_LETTER"
+}]]]></amqp:body>
+    </amqp:message>
+</amqp:publish>
+                <set-variable
+                    variableName="analyticsEventType"
+                    value="ORDER_FAILED"
+                    doc:name="Set Analytics Event Type"/>
+
+                <flow-ref name="track-analytics-flow" doc:name="Track DLQ Event"/>
+
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    status: "DEAD_LETTERED",
+    message: "Order could not be processed after maximum retry attempts. Archived for manual review.",
+    retryCount: vars.retryCount default 0,
+    failedService: vars.failedService default "unknown"
+}]'
+                    doc:name="Dead Letter Response"
+                    mimeType="application/json"/>
+
+            </when>
+            <otherwise>
+
+                <!-- Calculate backoff delay without do block -->
+                <set-variable
+                    variableName="retryCount"
+                    value="#[(vars.retryCount default 0) + 1]"
+                    doc:name="Increment Retry Count"/>
+
+<set-variable
+    variableName="backoffDelay"
+    value="#[%dw 2.0
+output application/java
+var attempt = vars.retryCount default 1
+var initial = 1000
+var maxDelay = 8000
+var calculated = initial * (2 pow (attempt as Number))
+---
+if (calculated > maxDelay) maxDelay else calculated as Number]"
+    doc:name="Calculate Backoff Delay"/>
+
+                <logger
+                    level="INFO"
+                    message='#["[RETRY] Backing off for " ++ (vars.backoffDelay default 1000 as String) ++ "ms | Retry attempt: " ++ (vars.retryCount default 1 as String)]'
+                    doc:name="Log Backoff"/>
+
+<amqp:publish
+    config-ref="AMQP_Config"
+    exchangeName="orderpulse.dlx"
+    doc:name="Publish to Retry Queue">
+    <amqp:routing-keys >
+						<amqp:routing-key value="${rabbitmq.queues.retry}" />
+					</amqp:routing-keys>
+					<amqp:message>
+        <amqp:body><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+    correlationId: vars.correlationId default "unknown",
+    orderId: vars.orderId default "unknown",
+    customerId: vars.customerId default "unknown",
+    customerTier: vars.customerTier default "STANDARD",
+    sku: vars.orderSku default "unknown",
+    quantity: vars.orderQuantity default 0,
+    orderType: vars.orderType default "STANDARD",
+    orderValue: vars.orderValue default 0,
+    priority: vars.processingPriority default "STANDARD",
+    routingPath: vars.routingPath default "STANDARD_LANE",
+    erpReservationId: vars.erpReservationId default null,
+    originalPayload: vars.originalPayload default {},
+    retryCount: vars.retryCount default 1,
+    failedService: vars.failedService default "unknown",
+    backoffDelay: vars.backoffDelay default 1000,
+    retryAfter: now() as String,
+    `type`: "RETRY"
+}]]]></amqp:body>
+    </amqp:message>
+</amqp:publish>
+
+                <logger
+                    level="INFO"
+                    message='#["[RETRY] Order " ++ (vars.correlationId default "unknown") ++ " queued for retry attempt " ++ (vars.retryCount default 1 as String)]'
+                    doc:name="Log Retry Queued"/>
+
+            </otherwise>
+        </choice>
+
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- CIRCUIT BREAKER CHECK FLOW                                   -->
+    <!-- ============================================================ -->
+    <flow name="circuit-breaker-check-flow" doc:name="Circuit Breaker Check">
+
+        <os:retrieve
+            key="#[vars.targetService ++ '-failures']"
+            objectStore="Circuit_Breaker_Store"
+            doc:name="Get Failure Count">
+            <os:default-value>#[{ count: 0, lastFailure: null, state: "CLOSED" }]</os:default-value>
+        </os:retrieve>
+
+        <set-variable
+            variableName="circuitState"
+            value="#[payload]"
+            doc:name="Store Circuit State"/>
+
+        <choice doc:name="Circuit Open?">
+            <when expression="#[vars.circuitState.state == 'OPEN']">
+
+                <logger
+                    level="WARN"
+                    message='#["[CIRCUIT BREAKER] Circuit OPEN for service: " ++ (vars.targetService default "unknown") ++ " — request blocked"]'
+                    doc:name="Log Circuit Open"/>
+
+                <raise-error
+                    type="APP:CIRCUIT_OPEN"
+                    description="#['Circuit breaker is open for service: ' ++ (vars.targetService default 'unknown')]"
+                    doc:name="Raise Circuit Open Error"/>
+
+            </when>
+            <otherwise>
+                <logger
+                    level="INFO"
+                    message='#["[CIRCUIT BREAKER] Circuit CLOSED for: " ++ (vars.targetService default "unknown") ++ " — proceeding"]'
+                    doc:name="Log Circuit Closed"/>
+            </otherwise>
+        </choice>
+
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- CIRCUIT BREAKER RECORD FAILURE FLOW                          -->
+    <!-- ============================================================ -->
+    <flow name="circuit-breaker-record-failure-flow" doc:name="Circuit Breaker Record Failure">
+
+        <os:retrieve
+            key="#[vars.targetService ++ '-failures']"
+            objectStore="Circuit_Breaker_Store"
+            doc:name="Get Current Failure State">
+            <os:default-value>#[{ count: 0, lastFailure: null, state: "CLOSED" }]</os:default-value>
+        </os:retrieve>
+
+        <set-variable
+            variableName="currentCount"
+            value="#[(payload.count default 0) + 1]"
+            doc:name="Increment Failure Count"/>
+
+        <set-variable
+            variableName="newCircuitState"
+            value="#[%dw 2.0
+output application/java
+var newCount = vars.currentCount default 1
+var threshold = 3
+---
+{
+    count: newCount,
+    lastFailure: now() as String,
+    state: if (newCount >= threshold) 'OPEN' else 'CLOSED',
+    openedAt: if (newCount >= threshold) (now() as String) else null
+}]"
+            doc:name="Calculate New Circuit State"/>
+
+        <os:store
+            key="#[vars.targetService ++ '-failures']"
+            objectStore="Circuit_Breaker_Store"
+            doc:name="Store Updated Circuit State">
+            <os:value>#[vars.newCircuitState]</os:value>
+        </os:store>
+
+        <choice doc:name="Circuit Just Opened?">
+            <when expression="#[vars.newCircuitState.state == 'OPEN']">
+                <logger
+                    level="ERROR"
+                    message='#["[CIRCUIT BREAKER] Circuit OPENED for: " ++ (vars.targetService default "unknown") ++ " after " ++ (vars.currentCount default 0 as String) ++ " failures"]'
+                    doc:name="Log Circuit Opened"/>
+            </when>
+            <otherwise>
+                <logger
+                    level="WARN"
+                    message='#["[CIRCUIT BREAKER] Failure " ++ (vars.currentCount default 0 as String) ++ "/3 for: " ++ (vars.targetService default "unknown")]'
+                    doc:name="Log Failure Count"/>
+            </otherwise>
+        </choice>
+
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- CIRCUIT BREAKER RESET FLOW                                   -->
+    <!-- ============================================================ -->
+    <flow name="circuit-breaker-reset-flow" doc:name="Circuit Breaker Reset">
+
+        <os:store
+            key="#[vars.targetService ++ '-failures']"
+            objectStore="Circuit_Breaker_Store"
+            doc:name="Reset Circuit State">
+            <os:value>#[{ count: 0, lastFailure: null, state: "CLOSED", resetAt: now() as String }]</os:value>
+        </os:store>
+
+        <logger
+            level="INFO"
+            message='#["[CIRCUIT BREAKER] Circuit RESET for: " ++ (vars.targetService default "unknown") ++ " — back to CLOSED"]'
+            doc:name="Log Circuit Reset"/>
+
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- SAGA ROLLBACK FLOW                                           -->
+    <!-- ============================================================ -->
+    <flow name="saga-rollback-flow" doc:name="Saga Rollback Coordinator">
+
+        <logger
+            level="ERROR"
+            message='#["[SAGA] Initiating rollback for order: " ++ (vars.correlationId default "unknown") ++ " | Failed step: " ++ (vars.failedStep default "unknown")]'
+            doc:name="Log Saga Rollback Start"/>
+
+        <choice doc:name="ERP Step Completed?">
+            <when expression="#[vars.erpReservationId != null]">
+
+                <logger
+                    level="WARN"
+                    message='#["[SAGA] Rolling back ERP reservation: " ++ (vars.erpReservationId default "unknown")]'
+                    doc:name="Log ERP Rollback"/>
+
+                <http:request
+                    method="POST"
+                    path="/inventory/release"
+                    config-ref="ERP_Request_Config"
+                    doc:name="Release ERP Inventory">
+                    <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId default "unknown",
+    sku: vars.orderSku default "unknown",
+    quantity: vars.orderQuantity default 0,
+    reservationId: vars.erpReservationId default "unknown"
+}]</http:body>
+                    <http:headers>#[{ "x-correlation-id": vars.correlationId default "unknown" }]</http:headers>
+                </http:request>
+
+                <logger
+                    level="INFO"
+                    message='#["[SAGA] ERP inventory released for order: " ++ (vars.correlationId default "unknown")]'
+                    doc:name="Log ERP Rollback Success"/>
+
+            </when>
+            <otherwise>
+                <logger
+                    level="INFO"
+                    message="#['[SAGA] ERP step not completed — no rollback needed']"
+                    doc:name="Log No ERP Rollback"/>
+            </otherwise>
+        </choice>
+
+        <logger
+            level="INFO"
+            message='#["[SAGA] Rollback complete for order: " ++ (vars.correlationId default "unknown")]'
+            doc:name="Log Saga Complete"/>
+
+        <set-payload
+            value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    status: "ROLLED_BACK",
+    message: "Order processing failed and all completed steps have been compensated.",
+    failedStep: vars.failedStep default "unknown"
+}]'
+            doc:name="Saga Rollback Response"
+            mimeType="application/json"/>
+
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- ANALYTICS TRACKING FLOW                                      -->
+    <!-- Fire and forget — errors never block order processing        -->
+    <!-- ============================================================ -->
+    <flow name="track-analytics-flow" doc:name="Track Analytics Event">
+
+        <try doc:name="Try Analytics Track">
+
+            <http:request
+                method="POST"
+                path="/analytics/track"
+                config-ref="Analytics_Request_Config"
+                doc:name="Track Event">
+                <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId default "unknown",
+    customerId: vars.customerId default "unknown",
+    customerTier: vars.customerTier default "STANDARD",
+    sku: vars.orderSku default "unknown",
+    quantity: vars.orderQuantity default 0,
+    orderValue: vars.orderValue default 0,
+    eventType: vars.analyticsEventType default "ORDER_EVENT",
+    channel: "MULESOFT_INTEGRATION"
+}]</http:body>
+                <http:headers>#[{ "x-correlation-id": vars.correlationId default "unknown" }]</http:headers>
+            </http:request>
+
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="Swallow Analytics Error">
+                    <logger
+                        level="WARN"
+                        message='#["[ANALYTICS] Tracking failed for order: " ++ (vars.correlationId default "unknown") ++ " — continuing"]'
+                        doc:name="Log Analytics Failure"/>
+                </on-error-continue>
+            </error-handler>
+
+        </try>
+
+    </flow>
+
+</mule>

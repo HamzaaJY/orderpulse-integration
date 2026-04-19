@@ -1,0 +1,53 @@
+http:
+  port: "8081"
+  basePath: "/api/v1"
+
+services:
+  erp:
+    host: "${ERP_HOST}"
+    port: "${ERP_PORT}"
+    basePath: "/api"
+    timeout: "15000"
+  crm:
+    host: "${CRM_HOST}"
+    port: "${CRM_PORT}"
+    basePath: "/api"
+    timeout: "10000"
+  warehouse:
+    host: "${WAREHOUSE_HOST}"
+    port: "${WAREHOUSE_PORT}"
+    basePath: "/api"
+    timeout: "8000"
+  analytics:
+    host: "${ANALYTICS_HOST}"
+    port: "${ANALYTICS_PORT}"
+    basePath: "/api"
+    timeout: "6000"
+
+rabbitmq:
+  host: "${RABBITMQ_HOST}"
+  port: "${RABBITMQ_PORT}"
+  username: "${RABBITMQ_USERNAME}"
+  password: "${RABBITMQ_PASSWORD}"
+  virtualHost: "/"
+  queues:
+    orderProcessing: "orderpulse.order.processing"
+    deadLetter: "orderpulse.dead.letter"
+    notifications: "orderpulse.notifications"
+    retry: "orderpulse.retry"
+
+retry:
+  maxAttempts: "5"
+  initialInterval: "2000"
+  multiplier: "2.0"
+  maxInterval: "16000"
+
+circuitBreaker:
+  threshold: "5"
+  timeout: "60000"
+  halfOpenAfter: "120000"
+
+cors:
+  allowedOrigins: "${ALLOWED_ORIGINS}"
+  allowedMethods: "GET,POST,PUT,DELETE,OPTIONS"
+  allowedHeaders: "Content-Type,Authorization,x-correlation-id,x-source-system,x-api-key"

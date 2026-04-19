@@ -1,0 +1,51 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OrderPulse Order Schema",
+  "description": "Validates incoming order payloads for the OrderPulse integration",
+  "type": "object",
+  "required": ["customerId", "sku", "quantity", "orderType"],
+  "properties": {
+    "customerId": {
+      "type": "string",
+      "pattern": "^CUST-[0-9]{3}$",
+      "description": "Customer identifier — must match CRM customer ID format"
+    },
+    "sku": {
+      "type": "string",
+      "enum": [
+        "SKU-LAPTOP-PRO",
+        "SKU-MONITOR-4K",
+        "SKU-KEYBOARD-MX",
+        "SKU-HEADSET-PRO",
+        "SKU-WEBCAM-HD"
+      ],
+      "description": "Product SKU — must exist in ERP inventory"
+    },
+    "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "Order quantity — must be between 1 and 100"
+    },
+    "orderType": {
+      "type": "string",
+      "enum": ["STANDARD", "EXPRESS", "INTERNATIONAL"],
+      "description": "Order type determines routing and priority"
+    },
+    "shippingAddress": {
+      "type": "object",
+      "properties": {
+        "street": { "type": "string" },
+        "city": { "type": "string" },
+        "state": { "type": "string" },
+        "zip": { "type": "string" },
+        "country": { "type": "string" }
+      }
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 500
+    }
+  },
+  "additionalProperties": false
+}

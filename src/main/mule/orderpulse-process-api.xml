@@ -1,0 +1,935 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/amqp
+        http://www.mulesoft.org/schema/mule/amqp/current/mule-amqp.xsd
+        http://www.mulesoft.org/schema/mule/os
+        http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd">
+
+    <!-- ============================================================ -->
+    <!-- PROCESS ORDER FLOW — THE ORCHESTRATOR                        -->
+    <!-- ============================================================ -->
+    <flow name="process-order-flow" doc:name="Process Order Orchestrator">
+
+		<logger level="INFO" 
+		        doc:name="Log Process Start" 
+		        message="#[%dw 2.0
+		output application/java
+		---
+		'[PROCESS API] Order received | OrderId: ' ++ (vars.orderId default 'unknown') ++ ' | Type: ' ++ (vars.orderType default 'unknown')]"/>
+
+        <!-- ── STEP 1: Circuit Breaker Check — CRM ──────────────── -->
+        <set-variable
+            variableName="targetService"
+            value="CRM"
+            doc:name="Set Target Service CRM"/>
+
+        <flow-ref
+            name="circuit-breaker-check-flow"
+            doc:name="Circuit Breaker Check CRM"/>
+
+        <!-- ── STEP 2: Enrich Order — Fetch Customer from CRM ───── -->
+        <try doc:name="Try CRM Enrichment">
+
+<http:request
+    method="GET"
+    path="/customers/{customerId}"
+    config-ref="CRM_Request_Config"
+    doc:name="Fetch Customer from CRM">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId,
+        "x-source-system": "orderpulse-process-api"
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        customerId: vars.customerId 
+    }]</http:uri-params>
+</http:request>
+
+            <set-variable
+                variableName="customerProfile"
+                value="#[payload.data]"
+                doc:name="Store Customer Profile"/>
+
+            <set-variable
+                variableName="customerTier"
+                value="#[payload.data.tier default 'STANDARD']"
+                doc:name="Store Customer Tier"/>
+
+            <set-variable
+                variableName="orderValue"
+                value="#[0]"
+                doc:name="Initialize Order Value"/>
+
+            <set-variable
+                variableName="targetService"
+                value="CRM"
+                doc:name="Set Target for Reset"/>
+
+            <flow-ref
+                name="circuit-breaker-reset-flow"
+                doc:name="Reset CRM Circuit Breaker"/>
+
+            <logger
+                level="INFO"
+                message='#["[PROCESS API] Customer enriched | Customer: " ++ (vars.customerProfile.name default "unknown") ++ " | Tier: " ++ vars.customerTier]'
+                doc:name="Log Customer Enriched"/>
+
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="CRM Enrichment Failed">
+
+                    <set-variable
+                        variableName="targetService"
+                        value="CRM"
+                        doc:name="Set Target for Failure"/>
+
+                    <flow-ref
+                        name="circuit-breaker-record-failure-flow"
+                        doc:name="Record CRM Failure"/>
+
+                    <set-variable
+                        variableName="customerProfile"
+                        value="#[{ name: 'Unknown', tier: 'STANDARD' }]"
+                        doc:name="Default Customer Profile"/>
+
+                    <set-variable
+                        variableName="customerTier"
+                        value="STANDARD"
+                        doc:name="Default Tier"/>
+
+                    <logger
+                        level="WARN"
+                        message='#["[PROCESS API] CRM enrichment failed — continuing with defaults | CorrelationId: " ++ vars.correlationId]'
+                        doc:name="Log CRM Fallback"/>
+
+                </on-error-continue>
+            </error-handler>
+
+        </try>
+
+        <!-- ── STEP 3: Content-Based Routing ────────────────────── -->
+        <choice doc:name="Route by Order Type">
+
+            <when expression="#[vars.orderType == 'EXPRESS']">
+                <logger
+                    level="INFO"
+                    message='#["[PROCESS API] EXPRESS order routing | OrderId: " ++ vars.orderId]'
+                    doc:name="Log Express Route"/>
+                <set-variable
+                    variableName="processingPriority"
+                    value="HIGH"
+                    doc:name="Set HIGH Priority"/>
+                <set-variable
+                    variableName="routingPath"
+                    value="EXPRESS_LANE"
+                    doc:name="Set Express Lane"/>
+            </when>
+
+            <when expression="#[vars.orderType == 'INTERNATIONAL']">
+                <logger
+                    level="INFO"
+                    message='#["[PROCESS API] INTERNATIONAL order routing | OrderId: " ++ vars.orderId]'
+                    doc:name="Log International Route"/>
+                <set-variable
+                    variableName="processingPriority"
+                    value="STANDARD"
+                    doc:name="Set Standard Priority"/>
+                <set-variable
+                    variableName="routingPath"
+                    value="INTERNATIONAL_LANE"
+                    doc:name="Set International Lane"/>
+                <set-variable
+                    variableName="complianceRequired"
+                    value="true"
+                    doc:name="Set Compliance Required"/>
+                <logger
+                    level="WARN"
+                    message='#["[PROCESS API] International order flagged for compliance | OrderId: " ++ vars.orderId]'
+                    doc:name="Log Compliance Flag"/>
+            </when>
+
+            <otherwise>
+                <logger
+                    level="INFO"
+                    message='#["[PROCESS API] STANDARD order routing | OrderId: " ++ vars.orderId]'
+                    doc:name="Log Standard Route"/>
+                <set-variable
+                    variableName="processingPriority"
+                    value="STANDARD"
+                    doc:name="Set Standard Priority"/>
+                <set-variable
+                    variableName="routingPath"
+                    value="STANDARD_LANE"
+                    doc:name="Set Standard Lane"/>
+            </otherwise>
+
+        </choice>
+
+        <!-- Enterprise tier priority upgrade -->
+        <choice doc:name="Enterprise Tier Priority Upgrade?">
+            <when expression="#[vars.customerTier == 'ENTERPRISE' and vars.processingPriority != 'HIGH']">
+                <set-variable
+                    variableName="processingPriority"
+                    value="HIGH"
+                    doc:name="Upgrade to HIGH for Enterprise"/>
+                <logger
+                    level="INFO"
+                    message='#["[PROCESS API] Enterprise customer priority upgrade | OrderId: " ++ vars.orderId]'
+                    doc:name="Log Priority Upgrade"/>
+            </when>
+            <otherwise>
+                <logger
+                    level="INFO"
+                    message='#["[PROCESS API] Priority: " ++ vars.processingPriority ++ " | Route: " ++ vars.routingPath]'
+                    doc:name="Log Routing Decision"/>
+            </otherwise>
+        </choice>
+
+        <!-- ── STEP 4: Circuit Breaker Check — ERP ──────────────── -->
+        <set-variable
+            variableName="targetService"
+            value="ERP"
+            doc:name="Set Target Service ERP"/>
+
+        <flow-ref
+            name="circuit-breaker-check-flow"
+            doc:name="Circuit Breaker Check ERP"/>
+
+        <!-- ── STEP 5: ERP — Inventory Check ────────────────────── -->
+        <try doc:name="Try ERP Inventory Check">
+
+<http:request
+    method="GET"
+    path="/inventory/check/{sku}"
+    config-ref="ERP_Request_Config"
+    doc:name="Check Inventory in ERP">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId,
+        "x-source-system": "orderpulse-process-api"
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        sku: vars.orderSku 
+    }]</http:uri-params>
+</http:request>
+
+            <set-variable
+                variableName="inventoryData"
+                value="#[payload.data]"
+                doc:name="Store Inventory Data"/>
+
+            <logger
+                level="INFO"
+                message='#["[PROCESS API] Inventory check | SKU: " ++ vars.orderSku ++ " | Available: " ++ (vars.inventoryData.available default 0 as String)]'
+                doc:name="Log Inventory Check"/>
+
+            <error-handler>
+                <on-error-propagate type="ANY" doc:name="ERP Check Failed">
+
+                    <set-variable
+                        variableName="targetService"
+                        value="ERP"
+                        doc:name="Set Target for ERP Failure"/>
+
+                    <flow-ref
+                        name="circuit-breaker-record-failure-flow"
+                        doc:name="Record ERP Failure"/>
+
+                    <set-variable
+                        variableName="failedService"
+                        value="ERP"
+                        doc:name="Set Failed Service"/>
+
+                    <set-variable
+                        variableName="failedStep"
+                        value="INVENTORY_CHECK"
+                        doc:name="Set Failed Step"/>
+
+                    <set-variable
+                        variableName="retryCount"
+                        value="0"
+                        doc:name="Initialize Retry Count"/>
+
+                    <flow-ref
+                        name="retry-with-backoff-flow"
+                        doc:name="Retry ERP Check"/>
+
+                </on-error-propagate>
+            </error-handler>
+
+        </try>
+
+        <!-- ── STEP 6: Validate Stock Availability ──────────────── -->
+        <choice doc:name="Sufficient Stock?">
+            <when expression="#[(vars.inventoryData.available default 0) &gt;= vars.orderQuantity]">
+
+                <!-- ── STEP 7: ERP Reserve Inventory — Saga Step 1 ── -->
+                <try doc:name="Try ERP Reserve">
+
+                    <http:request
+                        method="POST"
+                        path="/inventory/reserve"
+                        config-ref="ERP_Request_Config"
+                        doc:name="Reserve Inventory in ERP">
+                        <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    sku: vars.orderSku,
+    quantity: vars.orderQuantity,
+    customerId: vars.customerId
+}]</http:body>
+                        <http:headers>#[{
+                            "x-correlation-id": vars.correlationId,
+                            "x-source-system": "orderpulse-process-api"
+                        }]</http:headers>
+                    </http:request>
+
+                    <set-variable
+                        variableName="erpReservationId"
+                        value="#[payload.data.reservationId]"
+                        doc:name="Store Reservation ID"/>
+
+                    <set-variable
+                        variableName="orderValue"
+                        value="#[payload.data.totalValue default 0]"
+                        doc:name="Store Order Value"/>
+
+                    <set-variable
+                        variableName="targetService"
+                        value="ERP"
+                        doc:name="Set Target for ERP Reset"/>
+
+                    <flow-ref
+                        name="circuit-breaker-reset-flow"
+                        doc:name="Reset ERP Circuit Breaker"/>
+
+                   <logger level="INFO" 
+				        doc:name="Log Reservation Success"
+				        message="#[%dw 2.0
+				output application/java
+				---
+				'[PROCESS API] Inventory reserved | ReservationId: ' ++ (vars.erpReservationId default '') 
+				++ ' | Value: \$' ++ (vars.orderValue as String default '0')]"/>
+                    <error-handler>
+                        <on-error-propagate type="ANY" doc:name="ERP Reserve Failed">
+
+                            <set-variable
+                                variableName="targetService"
+                                value="ERP"
+                                doc:name="Set ERP Target"/>
+
+                            <flow-ref
+                                name="circuit-breaker-record-failure-flow"
+                                doc:name="Record ERP Reserve Failure"/>
+
+                            <set-variable
+                                variableName="failedStep"
+                                value="INVENTORY_RESERVE"
+                                doc:name="Set Failed Step"/>
+
+                            <set-variable
+                                variableName="erpReservationId"
+                                value="#[null]"
+                                doc:name="Clear Reservation ID"/>
+
+                            <flow-ref
+                                name="saga-rollback-flow"
+                                doc:name="Saga Rollback"/>
+
+                        </on-error-propagate>
+                    </error-handler>
+
+                </try>
+
+<!-- ── STEP 8: Async Handoff to Queue ───────────── -->
+<amqp:publish
+    config-ref="AMQP_Config"
+    exchangeName="orderpulse.dlx"
+    doc:name="Publish to Order Processing Queue" >
+					<amqp:routing-keys >
+						<amqp:routing-key value="${rabbitmq.queues.orderProcessing}" />
+					</amqp:routing-keys>
+					<amqp:message>
+        <amqp:body><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    correlationId: vars.correlationId,
+    customerId: vars.customerId,
+    customerTier: vars.customerTier,
+    sku: vars.orderSku,
+    quantity: vars.orderQuantity,
+    orderType: vars.orderType,
+    orderValue: vars.orderValue,
+    priority: vars.processingPriority,
+    routingPath: vars.routingPath,
+    erpReservationId: vars.erpReservationId,
+    complianceRequired: vars.complianceRequired default false,
+    publishedAt: now() as String
+}]]]></amqp:body>
+        <amqp:headers><![CDATA[#[{
+            "x-correlation-id": vars.correlationId,
+            "x-priority": vars.processingPriority,
+            "x-order-type": vars.orderType
+        }]]]></amqp:headers>
+    </amqp:message>
+</amqp:publish>
+
+                <logger
+                    level="INFO"
+                    message='#["[PROCESS API] Order published to queue | OrderId: " ++ vars.orderId ++ " | Priority: " ++ vars.processingPriority]'
+                    doc:name="Log Queue Publish"/>
+
+                <!-- ── STEP 9: Track in Analytics ───────────────── -->
+                <set-variable
+                    variableName="analyticsEventType"
+                    value="ORDER_RECEIVED"
+                    doc:name="Set Analytics Event"/>
+
+                <flow-ref
+                    name="track-analytics-flow"
+                    doc:name="Track Order Received"/>
+
+                <!-- ── STEP 10: Return 202 Accepted ─────────────── -->
+                <set-variable
+                    variableName="httpStatus"
+                    value="202"
+                    doc:name="Set 202 Accepted"/>
+
+<set-payload
+    value='#[%dw 2.0
+output application/json
+---
+{
+    success: true,
+    timestamp: now() as String,
+    correlationId: vars.correlationId,
+    orderId: vars.orderId,
+    status: "ACCEPTED",
+    message: "Order received and queued for processing.",
+    order: {
+        customerId: vars.customerId,
+        customerTier: vars.customerTier default "STANDARD",
+        sku: vars.orderSku,
+        quantity: vars.orderQuantity,
+        orderType: vars.orderType,
+        priority: vars.processingPriority default "STANDARD",
+        routingPath: vars.routingPath default "STANDARD_LANE",
+        estimatedValue: vars.orderValue default 0,
+        reservationId: vars.erpReservationId default null
+    },
+    tracking: {
+        statusEndpoint: "/api/v1/orders/" ++ (vars.orderId default "unknown"),
+        correlationId: vars.correlationId default "unknown"
+    }
+}]'
+    doc:name="202 Accepted Response"
+    mimeType="application/json"/>
+
+            </when>
+            <otherwise>
+
+                <logger
+                    level="WARN"
+                    message='#["[PROCESS API] Insufficient stock | SKU: " ++ vars.orderSku ++ " | Requested: " ++ (vars.orderQuantity as String) ++ " | Available: " ++ (vars.inventoryData.available default 0 as String)]'
+                    doc:name="Log Insufficient Stock"/>
+
+                <set-variable
+                    variableName="analyticsEventType"
+                    value="ORDER_FAILED"
+                    doc:name="Set Analytics Event"/>
+
+                <flow-ref
+                    name="track-analytics-flow"
+                    doc:name="Track Stock Failure"/>
+
+                <set-variable
+                    variableName="httpStatus"
+                    value="409"
+                    doc:name="Set 409"/>
+
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId,
+    orderId: vars.orderId,
+    error: {
+        `type`: "INSUFFICIENT_STOCK",
+        message: "Insufficient inventory for the requested quantity",
+        sku: vars.orderSku,
+        requested: vars.orderQuantity,
+        available: vars.inventoryData.available default 0,
+        code: 409
+    }
+}]'
+                    doc:name="Insufficient Stock Response"
+                    mimeType="application/json"/>
+
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <on-error-propagate
+                type="APP:CIRCUIT_OPEN"
+                doc:name="Circuit Open Error">
+                <set-variable
+                    variableName="httpStatus"
+                    value="503"
+                    doc:name="Set 503"/>
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "CIRCUIT_OPEN",
+        message: "A downstream service is temporarily unavailable. Please retry in 60 seconds.",
+        code: 503,
+        retryable: true,
+        retryAfter: "60 seconds"
+    }
+}]'
+                    doc:name="Circuit Open Response"
+                    mimeType="application/json"/>
+            </on-error-propagate>
+
+            <on-error-propagate
+                type="ANY"
+                doc:name="Process Error">
+                <logger
+                    level="ERROR"
+                    message='#["[PROCESS API] Unhandled error | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log Process Error"/>
+                <set-variable
+                    variableName="httpStatus"
+                    value="500"
+                    doc:name="Set 500"/>
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "PROCESSING_ERROR",
+        message: "Order processing failed unexpectedly",
+        code: 500
+    }
+}]'
+                    doc:name="Process Error Response"
+                    mimeType="application/json"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- ASYNC ORDER PROCESSOR — CONSUMES FROM QUEUE                  -->
+    <!-- ============================================================ -->
+    <flow name="async-order-processor-flow" doc:name="Async Order Processor">
+
+        <amqp:listener
+            config-ref="AMQP_Config"
+            queueName="orderpulse.order.processing"
+            doc:name="Listen on Order Processing Queue"
+            ackMode="MANUAL">
+        </amqp:listener>
+
+<set-variable
+            variableName="queueMessage"
+            value="#[%dw 2.0
+output application/java
+---
+if (payload is String) read(payload, 'application/json') else payload]"
+            doc:name="Parse Queue Message"/>
+            
+            <logger
+    level="INFO"
+    message='#[%dw 2.0&#10;output application/java&#10;---&#10;"[ASYNC DEBUG] Queue message keys: " ++ write(keysOf(vars.queueMessage), "application/json") &#10;++ " | customerId value: " ++ (vars.queueMessage.customerId default "NULL") &#10;++ " | orderId value: " ++ (vars.queueMessage.orderId default "NULL")]'
+    doc:name="Debug Queue Message"/>
+
+        <set-variable
+            variableName="correlationId"
+            value="#[vars.queueMessage.correlationId default uuid()]"
+            doc:name="Restore Correlation ID"/>
+
+        <set-variable
+            variableName="orderId"
+            value="#[vars.queueMessage.orderId]"
+            doc:name="Restore Order ID"/>
+
+        <set-variable
+            variableName="customerId"
+            value="#[vars.queueMessage.customerId]"
+            doc:name="Restore Customer ID"/>
+
+        <set-variable
+            variableName="customerTier"
+            value="#[vars.queueMessage.customerTier default 'STANDARD']"
+            doc:name="Restore Customer Tier"/>
+
+        <set-variable
+            variableName="orderSku"
+            value="#[vars.queueMessage.sku]"
+            doc:name="Restore SKU"/>
+
+        <set-variable
+            variableName="orderQuantity"
+            value="#[vars.queueMessage.quantity]"
+            doc:name="Restore Quantity"/>
+
+        <set-variable
+            variableName="orderValue"
+            value="#[vars.queueMessage.orderValue default 0]"
+            doc:name="Restore Order Value"/>
+
+        <set-variable
+            variableName="erpReservationId"
+            value="#[vars.queueMessage.erpReservationId]"
+            doc:name="Restore Reservation ID"/>
+
+        <set-variable
+            variableName="processingPriority"
+            value="#[vars.queueMessage.priority default 'STANDARD']"
+            doc:name="Restore Priority"/>
+
+        <logger
+            level="INFO"
+            message='#["[ASYNC PROCESSOR] Processing queued order | OrderId: " ++ (vars.orderId default "NULL") ++ " | Priority: " ++ (vars.processingPriority default "NULL")]'
+            doc:name="Log Async Processing Start"/>
+
+        <!-- ── SAGA STEP 2: Update CRM ───────────────────────────── -->
+        <!-- ── SAGA STEP 2: Update CRM ───────────────────────────── -->
+<try doc:name="Try CRM Update">
+
+    <set-variable
+        variableName="crmCustomerId"
+        value="#[vars.queueMessage.customerId]"
+        doc:name="Extract Customer ID for CRM"/>
+<logger
+    level="INFO"
+    message="#['[ASYNC DEBUG] crmCustomerId resolved to: ' ++ (vars.crmCustomerId default 'NULL')]"
+    doc:name="Debug CRM Customer ID"/>
+    <logger
+        level="INFO"
+        message="#['[ASYNC PROCESSOR] CRM update starting | CustomerId: ' ++ (vars.crmCustomerId default 'NULL') ++ ' | OrderId: ' ++ (vars.orderId default 'NULL')]"
+        doc:name="Log CRM Update Start"/>
+
+    <http:request
+    method="POST"
+    path="#['/customers/' ++ vars.queueMessage.customerId ++ '/order-update']"
+    config-ref="CRM_Request_Config"
+    doc:name="Update Customer in CRM">
+    <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    orderValue: vars.orderValue,
+    sku: vars.orderSku
+}]</http:body>
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-async-processor"
+    }]</http:headers>
+</http:request>
+
+    <set-variable
+        variableName="crmUpdated"
+        value="true"
+        doc:name="Mark CRM Updated"/>
+
+    <logger
+        level="INFO"
+        message='#["[ASYNC PROCESSOR] CRM updated | OrderId: " ++ vars.orderId]'
+        doc:name="Log CRM Updated"/>
+
+    <error-handler>
+        <on-error-propagate type="ANY" doc:name="CRM Update Failed">
+
+            <set-variable
+                variableName="failedStep"
+                value="CRM_UPDATE"
+                doc:name="Set Failed Step"/>
+
+            <logger
+                level="ERROR"
+                message='#["[ASYNC PROCESSOR] CRM update failed | OrderId: " ++ vars.orderId ++ " | Initiating saga rollback"]'
+                doc:name="Log CRM Failure"/>
+
+            <flow-ref
+                name="saga-rollback-flow"
+                doc:name="Saga Rollback on CRM Failure"/>
+
+            <set-variable
+                variableName="retryCount"
+                value="#[vars.retryCount default 0]"
+                doc:name="Initialize Retry"/>
+
+            <set-variable
+                variableName="failedService"
+                value="CRM"
+                doc:name="Set Failed Service"/>
+
+            <flow-ref
+                name="retry-with-backoff-flow"
+                doc:name="Retry CRM Update"/>
+
+        </on-error-propagate>
+    </error-handler>
+
+</try>
+        <!-- ── SAGA STEP 3: Notify Warehouse ────────────────────── -->
+        <try doc:name="Try Warehouse Notification">
+
+            <http:request doc:name="Notify Warehouse" doc:id="5b120bd0-d2a5-48cb-8273-0942e65313b1" config-ref="Warehouse_Request_Config" method="POST" path="/warehouse/notify">
+				<http:body ><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    sku: vars.orderSku,
+    quantity: vars.orderQuantity,
+    customerId: vars.customerId,
+    priority: vars.processingPriority
+}]]]></http:body>
+				<http:headers ><![CDATA[#[output application/java
+---
+{
+    "x-correlation-id": vars.correlationId,
+    "x-source-system": "orderpulse-async-processor"
+}]]]></http:headers>
+			</http:request>
+			<set-variable
+                variableName="warehouseTicketId"
+                value="#[payload.data.ticketId]"
+                doc:name="Store Warehouse Ticket ID"/>
+
+            <logger
+                level="INFO"
+                message='#["[ASYNC PROCESSOR] Warehouse notified | TicketId: " ++ vars.warehouseTicketId]'
+                doc:name="Log Warehouse Notified"/>
+
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="Warehouse Notification Failed">
+
+                    <logger
+                        level="WARN"
+                        message='#["[ASYNC PROCESSOR] Warehouse notification failed — continuing | OrderId: " ++ vars.orderId]'
+                        doc:name="Log Warehouse Failure"/>
+
+<amqp:publish
+    config-ref="AMQP_Config"
+    exchangeName="orderpulse.dlx"
+    routingKeys="${rabbitmq.queues.notifications}"
+    doc:name="Queue Warehouse Notification Retry">
+    <amqp:message>
+        <amqp:body>#[%dw 2.0
+            output application/json
+            ---
+            {
+                orderId: vars.orderId,
+                correlationId: vars.correlationId,
+                sku: vars.orderSku,
+                quantity: vars.orderQuantity,
+                customerId: vars.customerId,
+                priority: vars.processingPriority,
+                `type`: "WAREHOUSE_NOTIFICATION_RETRY",
+                queuedAt: now() as String
+            }]</amqp:body>
+    </amqp:message>
+</amqp:publish>
+
+                </on-error-continue>
+            </error-handler>
+
+        </try>
+
+        <!-- ── SAGA STEP 4: Track Completion in Analytics ───────── -->
+        <set-variable
+            variableName="analyticsEventType"
+            value="ORDER_COMPLETED"
+            doc:name="Set Completed Event"/>
+
+        <flow-ref
+            name="track-analytics-flow"
+            doc:name="Track Order Completed"/>
+
+        <amqp:ack
+            ackId="#[attributes.ackId]"
+            doc:name="Acknowledge Queue Message"/>
+
+        <logger
+            level="INFO"
+            message='#["[ASYNC PROCESSOR] Order fully processed | OrderId: " ++ vars.orderId ++ " | Value: $" ++ (vars.orderValue as String)]'
+            doc:name="Log Order Complete"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Async Processor Error">
+
+                <logger
+                    level="ERROR"
+                    message='#["[ASYNC PROCESSOR] Fatal error | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log Fatal Error"/>
+
+                <amqp:reject
+                    ackId="#[attributes.ackId]"
+                    requeue="true"
+                    doc:name="Reject and Requeue Message"/>
+
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+    <!-- ============================================================ -->
+    <!-- GET ORDER STATUS FLOW                                        -->
+    <!-- ============================================================ -->
+    <flow name="get-order-status-flow" doc:name="Get Order Status">
+
+        <logger
+            level="INFO"
+            message='#["[PROCESS API] Status request | OrderId: " ++ vars.orderId]'
+            doc:name="Log Status Request"/>
+
+        <try doc:name="Try Get ERP Status">
+
+<http:request
+    method="GET"
+    path="/fulfillment/status/{orderId}"
+    config-ref="ERP_Request_Config"
+    doc:name="Get ERP Fulfillment Status">
+    <http:headers>#[{ 
+        "x-correlation-id": vars.correlationId 
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        orderId: vars.orderId 
+    }]</http:uri-params>
+</http:request>
+
+            <set-variable
+                variableName="erpStatus"
+                value="#[payload.data]"
+                doc:name="Store ERP Status"/>
+
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="ERP Status Error">
+                    <set-variable
+                        variableName="erpStatus"
+                        value="#[{ status: 'UNKNOWN', message: 'ERP status unavailable' }]"
+                        doc:name="Default ERP Status"/>
+                </on-error-continue>
+            </error-handler>
+
+        </try>
+
+        <try doc:name="Try Get Warehouse Status">
+
+<http:request
+    method="GET"
+    path="/warehouse/status/{orderId}"
+    config-ref="Warehouse_Request_Config"
+    doc:name="Get Warehouse Status">
+    <http:headers>#[{ 
+        "x-correlation-id": vars.correlationId 
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        orderId: vars.orderId 
+    }]</http:uri-params>
+</http:request>
+
+            <set-variable
+                variableName="warehouseStatus"
+                value="#[payload.data]"
+                doc:name="Store Warehouse Status"/>
+
+            <error-handler>
+                <on-error-continue type="ANY" doc:name="Warehouse Status Error">
+                    <set-variable
+                        variableName="warehouseStatus"
+                        value="#[{ status: 'UNKNOWN', message: 'Warehouse status unavailable' }]"
+                        doc:name="Default Warehouse Status"/>
+                </on-error-continue>
+            </error-handler>
+
+        </try>
+
+        <set-variable
+            variableName="httpStatus"
+            value="200"
+            doc:name="Set 200"/>
+
+        <set-payload
+            value='#[%dw 2.0
+output application/json
+---
+{
+    success: true,
+    timestamp: now() as String,
+    correlationId: vars.correlationId,
+    orderId: vars.orderId,
+    status: {
+        erp: {
+            fulfillmentStatus: (vars.erpStatus.status default "UNKNOWN"),
+            fulfillmentId: (vars.erpStatus.fulfillmentId default null),
+            estimatedShipDate: (vars.erpStatus.estimatedShipDate default null)
+        },
+        warehouse: {
+            pickStatus: (vars.warehouseStatus.status default "UNKNOWN"),
+            ticketId: (vars.warehouseStatus.ticketId default null),
+            location: (vars.warehouseStatus.location default null),
+            stages: (vars.warehouseStatus.stages default [])
+        }
+    }
+}]'
+            doc:name="Order Status Response"
+            mimeType="application/json"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="Status Flow Error">
+                <set-variable
+                    variableName="httpStatus"
+                    value="500"
+                    doc:name="Set 500"/>
+                <set-payload
+                    value='#[%dw 2.0
+output application/json
+---
+{
+    success: false,
+    timestamp: now() as String,
+    correlationId: vars.correlationId default "unknown",
+    error: {
+        `type`: "STATUS_ERROR",
+        message: "Failed to retrieve order status",
+        code: 500
+    }
+}]'
+                    doc:name="Status Error Response"
+                    mimeType="application/json"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+</mule>

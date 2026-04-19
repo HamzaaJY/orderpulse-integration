@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd">
+
+    <!-- ============================================================ -->
+    <!-- WAREHOUSE SYSTEM API                                         -->
+    <!-- Dedicated connector layer to the Warehouse mock service      -->
+    <!-- Handles: pick ticket creation, status, stage advancement     -->
+    <!-- ============================================================ -->
+
+    <!-- Notify warehouse — create pick ticket -->
+    <flow name="warehouse-notify-flow" doc:name="Warehouse Notify">
+
+        <logger
+            level="INFO"
+            message='#["[WAREHOUSE SYSTEM API] Creating pick ticket | OrderId: " ++ (vars.orderId default "unknown") ++ " | Priority: " ++ (vars.processingPriority default "STANDARD")]'
+            doc:name="Log Notify Request"/>
+
+        <http:request
+            method="POST"
+            path="/warehouse/notify"
+            config-ref="Warehouse_Request_Config"
+            doc:name="POST Warehouse Notify">
+            <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    sku: vars.orderSku,
+    quantity: vars.orderQuantity,
+    customerId: vars.customerId,
+    priority: vars.processingPriority default "STANDARD"
+}]</http:body>
+            <http:headers>#[{
+                "x-correlation-id": vars.correlationId default "unknown",
+                "x-source-system": "orderpulse-warehouse-system-api",
+                "x-request-timestamp": now() as String
+            }]</http:headers>
+        </http:request>
+
+        <logger
+            level="INFO"
+            message='#["[WAREHOUSE SYSTEM API] Pick ticket created | TicketId: " ++ (payload.data.ticketId default "unknown") ++ " | Zone: " ++ (payload.data.location.zone default "unknown")]'
+            doc:name="Log Ticket Created"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="Warehouse Notify Error">
+                <logger
+                    level="ERROR"
+                    message='#["[WAREHOUSE SYSTEM API] Pick ticket creation failed | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log Warehouse Notify Error"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+    <!-- Get pick ticket status -->
+    <flow name="warehouse-get-status-flow" doc:name="Warehouse Get Status">
+
+        <logger
+            level="INFO"
+            message='#["[WAREHOUSE SYSTEM API] Fetching pick status | OrderId: " ++ (vars.orderId default "unknown")]'
+            doc:name="Log Status Request"/>
+
+<http:request
+    method="GET"
+    path="/warehouse/status/{orderId}"
+    config-ref="Warehouse_Request_Config"
+    doc:name="GET Warehouse Status">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-warehouse-system-api"
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        orderId: vars.orderId 
+    }]</http:uri-params>
+</http:request>
+
+        <logger
+            level="INFO"
+            message='#["[WAREHOUSE SYSTEM API] Status retrieved | OrderId: " ++ (vars.orderId default "unknown") ++ " | Status: " ++ (payload.data.status default "UNKNOWN")]'
+            doc:name="Log Status Retrieved"/>
+
+        <error-handler>
+            <on-error-continue type="ANY" doc:name="Warehouse Status Error">
+                <logger
+                    level="WARN"
+                    message='#["[WAREHOUSE SYSTEM API] Status unavailable | OrderId: " ++ (vars.orderId default "unknown")]'
+                    doc:name="Log Warehouse Status Error"/>
+                <set-payload
+                    value='#[{ data: { status: "UNKNOWN", message: "Warehouse status temporarily unavailable" } }]'
+                    doc:name="Default Status Response"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+    <!-- Advance pick ticket stage -->
+    <flow name="warehouse-advance-stage-flow" doc:name="Warehouse Advance Stage">
+
+        <logger
+            level="INFO"
+            message='#["[WAREHOUSE SYSTEM API] Advancing stage | OrderId: " ++ (vars.orderId default "unknown")]'
+            doc:name="Log Advance Request"/>
+
+<http:request
+    method="PATCH"
+    path="/warehouse/advance/{orderId}"
+    config-ref="Warehouse_Request_Config"
+    doc:name="PATCH Advance Stage">
+    <http:headers>#[{
+        "x-correlation-id": vars.correlationId default "unknown",
+        "x-source-system": "orderpulse-warehouse-system-api"
+    }]</http:headers>
+    <http:uri-params>#[{ 
+        orderId: vars.orderId 
+    }]</http:uri-params>
+</http:request>
+
+        <logger
+            level="INFO"
+            message='#["[WAREHOUSE SYSTEM API] Stage advanced | OrderId: " ++ (vars.orderId default "unknown") ++ " | New Status: " ++ (payload.data.status default "UNKNOWN")]'
+            doc:name="Log Stage Advanced"/>
+
+        <error-handler>
+            <on-error-propagate type="ANY" doc:name="Warehouse Advance Error">
+                <logger
+                    level="ERROR"
+                    message='#["[WAREHOUSE SYSTEM API] Stage advance failed | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]'
+                    doc:name="Log Advance Error"/>
+            </on-error-propagate>
+        </error-handler>
+
+    </flow>
+
+</mule>
