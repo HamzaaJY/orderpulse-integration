@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+<mule xmlns:scripting="http://www.mulesoft.org/schema/mule/scripting"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
       xmlns:http="http://www.mulesoft.org/schema/mule/http"
       xmlns:amqp="http://www.mulesoft.org/schema/mule/amqp"
       xmlns:os="http://www.mulesoft.org/schema/mule/os"
       xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
       xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/scripting http://www.mulesoft.org/schema/mule/scripting/current/mule-scripting.xsd 
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
 http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd 
         http://www.mulesoft.org/schema/mule/core
         http://www.mulesoft.org/schema/mule/core/current/mule.xsd
@@ -115,10 +119,10 @@ if (calculated > maxDelay) maxDelay else calculated as Number]"
     config-ref="AMQP_Config"
     exchangeName="orderpulse.dlx"
     doc:name="Publish to Retry Queue">
-    <amqp:routing-keys >
-						<amqp:routing-key value="${rabbitmq.queues.retry}" />
-					</amqp:routing-keys>
-					<amqp:message>
+    <amqp:routing-keys>
+        <amqp:routing-key value="${rabbitmq.queues.retry}" />
+    </amqp:routing-keys>
+    <amqp:message>
         <amqp:body><![CDATA[#[%dw 2.0
 output application/json
 ---
@@ -141,6 +145,10 @@ output application/json
     retryAfter: now() as String,
     `type`: "RETRY"
 }]]]></amqp:body>
+        <!-- ADD THIS — tells RabbitMQ to hold the message for backoffDelay ms -->
+        <amqp:headers>#[{
+            "x-delay": vars.backoffDelay default 1000
+        }]</amqp:headers>
     </amqp:message>
 </amqp:publish>
 
@@ -153,6 +161,60 @@ output application/json
         </choice>
 
     </flow>
+    
+    <flow name="retry-consumer-flow" doc:name="Retry Consumer">
+
+    <amqp:listener
+        config-ref="AMQP_Config"
+        queueName="orderpulse.retry"
+        doc:name="Listen on Retry Queue"
+        ackMode="AUTO">
+    </amqp:listener>
+
+    <!-- Parse the retry message -->
+    <set-variable
+        variableName="retryMessage"
+        value="#[%dw 2.0
+output application/java
+---
+if (payload is String) read(payload, 'application/json') else payload]"
+        doc:name="Parse Retry Message"/>
+
+    <!-- Restore all vars from the retry envelope -->
+    <set-variable variableName="correlationId"      value="#[vars.retryMessage.correlationId default uuid()]"       doc:name="Restore correlationId"/>
+    <set-variable variableName="orderId"            value="#[vars.retryMessage.orderId default 'unknown']"           doc:name="Restore orderId"/>
+    <set-variable variableName="customerId"         value="#[vars.retryMessage.customerId default 'unknown']"        doc:name="Restore customerId"/>
+    <set-variable variableName="customerTier"       value="#[vars.retryMessage.customerTier default 'STANDARD']"     doc:name="Restore customerTier"/>
+    <set-variable variableName="orderSku"           value="#[vars.retryMessage.sku default 'unknown']"               doc:name="Restore sku"/>
+    <set-variable variableName="orderQuantity"      value="#[vars.retryMessage.quantity default 0]"                  doc:name="Restore quantity"/>
+    <set-variable variableName="orderType"          value="#[vars.retryMessage.orderType default 'STANDARD']"        doc:name="Restore orderType"/>
+    <set-variable variableName="orderValue"         value="#[vars.retryMessage.orderValue default 0]"                doc:name="Restore orderValue"/>
+    <set-variable variableName="processingPriority" value="#[vars.retryMessage.priority default 'STANDARD']"         doc:name="Restore priority"/>
+    <set-variable variableName="routingPath"        value="#[vars.retryMessage.routingPath default 'STANDARD_LANE']" doc:name="Restore routingPath"/>
+    <set-variable variableName="erpReservationId"   value="#[vars.retryMessage.erpReservationId]"                    doc:name="Restore erpReservationId"/>
+    <set-variable variableName="failedService"      value="#[vars.retryMessage.failedService default 'unknown']"     doc:name="Restore failedService"/>
+    <set-variable variableName="retryCount"         value="#[vars.retryMessage.retryCount default 1]"                doc:name="Restore retryCount"/>
+
+    <logger
+        level="WARN"
+        message='#["[RETRY CONSUMER] Processing retry | OrderId: " ++ vars.orderId ++ " | Attempt: " ++ (vars.retryCount as String) ++ "/" ++ "3" ++ " | Failed service: " ++ vars.failedService]'
+        doc:name="Log Retry Pickup"/>
+
+    <!-- Invoke retry logic — increments count, publishes to DLQ at attempt 3 -->
+    <flow-ref
+        name="retry-with-backoff-flow"
+        doc:name="Re-invoke Retry Flow"/>
+
+    <error-handler>
+        <on-error-continue type="ANY" doc:name="Retry Consumer Error">
+            <logger
+                level="ERROR"
+                message='#["[RETRY CONSUMER] Error in retry consumer | OrderId: " ++ (vars.orderId default "unknown") ++ " | " ++ error.description]'
+                doc:name="Log Error"/>
+        </on-error-continue>
+    </error-handler>
+
+</flow>
 
     <!-- ============================================================ -->
     <!-- CIRCUIT BREAKER CHECK FLOW                                   -->

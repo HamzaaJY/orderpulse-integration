@@ -554,6 +554,11 @@ output application/json
             doc:name="Listen on Order Processing Queue"
             ackMode="MANUAL">
         </amqp:listener>
+        
+            <set-variable
+        variableName="ackId"
+        value="#[attributes.ackId]"
+        doc:name="Capture AMQP ackId before attributes is overwritten"/>
 
 <set-variable
             variableName="queueMessage"
@@ -699,10 +704,77 @@ output application/json
     </error-handler>
 
 </try>
+<try doc:name="Try ERP Fulfillment Trigger">
+    
+    <logger
+        level="INFO"
+        message='#["[ASYNC PROCESSOR] ERP fulfillment starting | OrderId: " ++ (vars.orderId default "NULL")]'
+        doc:name="Log ERP Start"/>
+
+    <http:request
+        method="POST"
+        path="/fulfillment/trigger"
+        config-ref="ERP_Request_Config"
+        doc:name="Trigger ERP Fulfillment"
+        target="erpResponse">
+        <http:body>#[%dw 2.0
+output application/json
+---
+{
+    orderId: vars.orderId,
+    sku: vars.orderSku,
+    quantity: vars.orderQuantity,
+    customerId: vars.customerId
+}]</http:body>
+        <http:headers>#[{
+            "x-correlation-id": vars.correlationId default "unknown",
+            "x-source-system": "orderpulse-async-processor"
+        }]</http:headers>
+    </http:request>
+
+    <set-variable
+        variableName="erpFulfillmentId"
+        value="#[vars.erpResponse.data.fulfillmentId]"
+        doc:name="Store ERP Fulfillment ID"/>
+
+    <logger
+        level="INFO"
+        message='#["[ASYNC PROCESSOR] ERP notified | FulfillmentId: " ++ (vars.erpFulfillmentId default "PENDING")]'
+        doc:name="Log ERP Success"/>
+
+    <error-handler>
+        <on-error-propagate type="ANY" doc:name="ERP Trigger Failed">
+            
+            <set-variable
+                variableName="failedStep"
+                value="ERP_FULFILLMENT"
+                doc:name="Set Failed Step"/>
+
+            <logger
+                level="ERROR"
+                message='#["[ASYNC PROCESSOR] ERP fulfillment failed | OrderId: " ++ vars.orderId ++ " | Initiating saga rollback"]'
+                doc:name="Log ERP Failure"/>
+
+            <flow-ref
+                name="saga-rollback-flow"
+                doc:name="Saga Rollback on ERP Failure"/>
+
+            <set-variable
+                variableName="failedService"
+                value="ERP"
+                doc:name="Set Failed Service"/>
+
+            <flow-ref
+                name="retry-with-backoff-flow"
+                doc:name="Retry ERP Update"/>
+                
+        </on-error-propagate>
+    </error-handler>
+</try>
         <!-- ── SAGA STEP 3: Notify Warehouse ────────────────────── -->
         <try doc:name="Try Warehouse Notification">
 
-            <http:request doc:name="Notify Warehouse" doc:id="5b120bd0-d2a5-48cb-8273-0942e65313b1" config-ref="Warehouse_Request_Config" method="POST" path="/warehouse/notify">
+            <http:request doc:name="Notify Warehouse" doc:id="660e67a9-a799-42b3-85ff-45620c389df4" config-ref="Warehouse_Request_Config" method="POST" path="/warehouse/notify">
 				<http:body ><![CDATA[#[%dw 2.0
 output application/json
 ---
@@ -776,29 +848,28 @@ output application/json
             doc:name="Track Order Completed"/>
 
         <amqp:ack
-            ackId="#[attributes.ackId]"
-            doc:name="Acknowledge Queue Message"/>
+		    ackId="#[vars.ackId]"
+		    doc:name="Acknowledge Queue Message"/>
 
         <logger
             level="INFO"
-            message='#["[ASYNC PROCESSOR] Order fully processed | OrderId: " ++ vars.orderId ++ " | Value: $" ++ (vars.orderValue as String)]'
+            message='#[%dw 2.0&#10;output application/java&#10;---&#10;"[ASYNC PROCESSOR] Order fully processed | OrderId: " &#10;++ (vars.orderId default "N/A") &#10;++ (vars.orderValue as String default "0.00")]'
             doc:name="Log Order Complete"/>
 
         <error-handler>
+            
             <on-error-continue type="ANY" doc:name="Async Processor Error">
+    <logger level="ERROR" 
+            message='#["[ASYNC PROCESSOR] Fatal error | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]' 
+            doc:name="Log Fatal Error"/>
 
-                <logger
-                    level="ERROR"
-                    message='#["[ASYNC PROCESSOR] Fatal error | OrderId: " ++ (vars.orderId default "unknown") ++ " | Error: " ++ error.description]'
-                    doc:name="Log Fatal Error"/>
+    <flow-ref name="retry-with-backoff-flow" doc:name="Trigger Backoff Retry"/>
 
-                <amqp:reject
-                    ackId="#[attributes.ackId]"
-                    requeue="true"
-                    doc:name="Reject and Requeue Message"/>
-
-            </on-error-continue>
-        </error-handler>
+    <amqp:ack ackId="#[vars.ackId]" doc:name="Acknowledge Original Message"/>
+</on-error-continue>
+            
+            
+           </error-handler>
 
     </flow>
 
@@ -815,16 +886,16 @@ output application/json
         <try doc:name="Try Get ERP Status">
 
 <http:request
-    method="GET"
+	method="GET"
     path="/fulfillment/status/{orderId}"
     config-ref="ERP_Request_Config"
     doc:name="Get ERP Fulfillment Status">
-    <http:headers>#[{ 
-        "x-correlation-id": vars.correlationId 
-    }]</http:headers>
-    <http:uri-params>#[{ 
-        orderId: vars.orderId 
-    }]</http:uri-params>
+    <http:headers><![CDATA[#[{ 
+        "x-correlation-id": vars.correlationId
+    }]]]></http:headers>
+<http:uri-params><![CDATA[#[{ 
+    orderId: vars.orderId default ""
+}]]]></http:uri-params>
 </http:request>
 
             <set-variable
@@ -853,9 +924,9 @@ output application/json
     <http:headers>#[{ 
         "x-correlation-id": vars.correlationId 
     }]</http:headers>
-    <http:uri-params>#[{ 
-        orderId: vars.orderId 
-    }]</http:uri-params>
+ <http:uri-params>#[{ 
+    orderId: trim(vars.orderId default "") 
+}]</http:uri-params>
 </http:request>
 
             <set-variable
@@ -880,28 +951,7 @@ output application/json
             doc:name="Set 200"/>
 
         <set-payload
-            value='#[%dw 2.0
-output application/json
----
-{
-    success: true,
-    timestamp: now() as String,
-    correlationId: vars.correlationId,
-    orderId: vars.orderId,
-    status: {
-        erp: {
-            fulfillmentStatus: (vars.erpStatus.status default "UNKNOWN"),
-            fulfillmentId: (vars.erpStatus.fulfillmentId default null),
-            estimatedShipDate: (vars.erpStatus.estimatedShipDate default null)
-        },
-        warehouse: {
-            pickStatus: (vars.warehouseStatus.status default "UNKNOWN"),
-            ticketId: (vars.warehouseStatus.ticketId default null),
-            location: (vars.warehouseStatus.location default null),
-            stages: (vars.warehouseStatus.stages default [])
-        }
-    }
-}]'
+            value='#[%dw 2.0&#10;output application/json&#10;---&#10;{&#10;    success: true,&#10;    timestamp: now() as String,&#10;    correlationId: vars.correlationId,&#10;    orderId: vars.orderId,&#10;    status: {&#10;        erp: {&#10;            fulfillmentStatus: (vars.erpStatus.status default "UNKNOWN"),&#10;            fulfillmentId: (vars.erpStatus.fulfillmentId default null),&#10;            estimatedShipDate: (vars.erpStatus.estimatedShipDate default null)&#10;        },&#10;        warehouse: {&#10;            pickStatus: (vars.warehouseStatus.status default "UNKNOWN"),&#10;            ticketId: (vars.warehouseStatus.ticketId default null),&#10;            location: (vars.warehouseStatus.location default null),&#10;         &#10;        }&#10;    }&#10;}]'
             doc:name="Order Status Response"
             mimeType="application/json"/>
 

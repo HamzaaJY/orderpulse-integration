@@ -18,20 +18,20 @@ http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/htt
         <http:listener
             config-ref="HTTP_Listener_Config"
             path="${http.basePath}/orders"
-            allowedMethods="POST"
+            allowedMethods="POST, OPTIONS"
             doc:name="POST /orders">
             <http:response statusCode="#[vars.httpStatus default 202]">
-                <http:headers>#[{
+                <http:headers><![CDATA[#[{
                     'Content-Type': 'application/json',
                     'x-correlation-id': vars.correlationId default '',
                     'x-request-id': vars.orderId default ''
-                }]</http:headers>
+                }]]]></http:headers>
             </http:response>
             <http:error-response statusCode="#[vars.httpStatus default 500]">
-                <http:headers>#[{
+                <http:headers><![CDATA[#[{
                     'Content-Type': 'application/json',
                     'x-correlation-id': vars.correlationId default ''
-                }]</http:headers>
+                }]]]></http:headers>
             </http:error-response>
         </http:listener>
 
@@ -116,10 +116,7 @@ output application/json
 
                                         <set-variable
                                             variableName="idempotencyKey"
-                                            value="#[%dw 2.0
-output application/java
----
-vars.customerId ++ '-' ++ vars.orderSku ++ '-' ++ (vars.incomingPayload.idempotencyKey default vars.orderId)]"
+                                            value="#[%dw 2.0&#10;output application/java&#10;---&#10;(vars.customerId default &quot;GUEST&quot;) &#10;++ &quot;-&quot; ++ &#10;(attributes.headers['x-correlation-id'] default vars.orderId)]"
                                             doc:name="Build Idempotency Key"/>
 
                                         <!-- Store result in variable — never let it overwrite payload -->
@@ -165,14 +162,14 @@ output application/json
                                                     key="#[vars.idempotencyKey]"
                                                     objectStore="Idempotency_Store"
                                                     doc:name="Store Idempotency Key">
-                                                    <os:value>#[%dw 2.0
+                                                    <os:value><![CDATA[#[%dw 2.0
 output application/java
 ---
 {
     orderId: vars.orderId,
     receivedAt: now() as String,
     correlationId: vars.correlationId
-}]</os:value>
+}]]]></os:value>
                                                 </os:store>
 
                                                 <logger
@@ -344,9 +341,12 @@ output application/json
         </http:listener>
 
         <set-variable
-            variableName="correlationId"
-            value="#[correlationId default uuid()]"
-            doc:name="Set Correlation ID"/>
+		    variableName="correlationId"
+		    value="#[%dw 2.0
+		output application/java
+		---
+		'OP-' ++ (now() as Number) ++ '-' ++ (uuid()[0 to 7])]"
+		    doc:name="Set Custom Correlation ID"/>
 
         <set-variable
             variableName="orderId"
@@ -485,42 +485,47 @@ output application/json
     <!-- ============================================================ -->
     <!-- CIRCUIT BREAKER RESET                                        -->
     <!-- ============================================================ -->
-    <flow name="reset-circuit-breaker-flow" doc:name="Reset Circuit Breaker">
+<flow name="reset-circuit-breaker-flow" doc:name="Reset Circuit Breaker">
+    <http:listener
+        config-ref="HTTP_Listener_Config"
+        path="${http.basePath}/circuit-breaker/{service}/reset"
+        allowedMethods="POST, OPTIONS"
+        doc:name="POST /circuit-breaker/{service}/reset">
 
-        <http:listener
-            config-ref="HTTP_Listener_Config"
-            path="${http.basePath}/circuit-breaker/{service}/reset"
-            allowedMethods="POST"
-            doc:name="POST /circuit-breaker/{service}/reset"/>
+    </http:listener>
 
-        <set-variable
-            variableName="targetService"
-            value="#[attributes.uriParams.service]"
-            doc:name="Extract Service Name"/>
+    <choice doc:name="Route by Method">
+        <when expression="#[attributes.method == 'OPTIONS']">
+            <set-payload value="#['']" doc:name="Handshake Success"/>
+        </when>
 
-        <logger
-            level="INFO"
-            message="#['[CIRCUIT BREAKER] Manual reset requested for service: ' ++ (vars.targetService default 'unknown')]"
-            doc:name="Log Reset Request"/>
+        <otherwise>
+            <set-variable
+                variableName="targetService"
+                value="#[attributes.uriParams.service default 'UNKNOWN']"
+                doc:name="Extract Service Name"/>
 
-        <flow-ref
-            name="circuit-breaker-reset-flow"
-            doc:name="Reset Circuit Breaker"/>
+            <logger
+                level="INFO"
+                message="#['[CIRCUIT BREAKER] Reset requested for: ' ++ vars.targetService]"
+                doc:name="Log Request"/>
 
-        <set-payload
-            value='#[%dw 2.0
+            <flow-ref
+                name="circuit-breaker-reset-flow"
+                doc:name="Reset Logic"/>
+
+            <set-payload
+                value='#[%dw 2.0
 output application/json
 ---
 {
-    success: true,
-    timestamp: now() as String,
-    message: "Circuit breaker reset successfully for service: " ++ (vars.targetService default "unknown"),
-    service: vars.targetService default "unknown",
-    state: "CLOSED"
+    "success": true,
+    "service": vars.targetService,
+    "status": "CLOSED"
 }]'
-            doc:name="Reset Response"
-            mimeType="application/json"/>
-
-    </flow>
-
+                doc:name="JSON Response"
+                mimeType="application/json"/>
+        </otherwise>
+    </choice>
+</flow>
 </mule>
