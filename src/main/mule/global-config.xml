@@ -38,17 +38,20 @@ http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/htt
     <http:listener-interceptors>
         <http:cors-interceptor>
             <http:origins>
-                <http:origin url="${api.cors.origin}" accessControlMaxAge="3600">
+                <http:origin url="${api.cors.origin}" accessControlMaxAge="3600" >
                     <http:allowed-methods>
                         <http:method methodName="GET" />
                         <http:method methodName="POST" />
                         <http:method methodName="OPTIONS" />
                     </http:allowed-methods>
                     <http:allowed-headers>
+                    	<http:header headerName="Authorization" />
                         <http:header headerName="x-correlation-id" />
                         <http:header headerName="X-Correlation-Id" />
                         <http:header headerName="Content-Type" />
                         <http:header headerName="X-Idempotency-Key" />
+                        <http:header headerName="x-source-system" />
+                        <http:header headerName="x-user-id" />
                         <http:header headerName="*" />
                     </http:allowed-headers>
                 </http:origin>

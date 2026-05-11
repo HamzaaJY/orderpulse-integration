@@ -34,6 +34,12 @@ http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/htt
                 }]]]></http:headers>
             </http:error-response>
         </http:listener>
+        
+        <!-- ── Extract userId from inbound header — threads through entire pipeline ── -->
+<set-variable
+    variableName="userId"
+    value="#[attributes.headers['x-user-id'] default 'anonymous']"
+    doc:name="Extract userId from header"/>
 
         <set-variable
             variableName="correlationId"
@@ -116,7 +122,7 @@ output application/json
 
                                         <set-variable
                                             variableName="idempotencyKey"
-                                            value="#[%dw 2.0&#10;output application/java&#10;---&#10;(vars.customerId default &quot;GUEST&quot;) &#10;++ &quot;-&quot; ++ &#10;(attributes.headers['x-correlation-id'] default vars.orderId)]"
+                                            value="#[%dw 2.0&#10;output application/java&#10;---&#10;(vars.userId default &quot;GUEST&quot;) &#10;++ &quot;-&quot; ++ &#10;(attributes.headers['x-correlation-id'] default vars.orderId)]"
                                             doc:name="Build Idempotency Key"/>
 
                                         <!-- Store result in variable — never let it overwrite payload -->
@@ -353,7 +359,8 @@ output application/json
             value="#[attributes.uriParams.orderId]"
             doc:name="Extract Order ID"/>
 
-        <logger
+        <set-variable value="#[attributes.headers['x-user-id'] default &quot;anonymous&quot;]" doc:name="Capture the User ID" doc:id="a8658247-0db2-48c0-b5a8-09d8c42da72d" variableName="userId" />
+		<logger
             level="INFO"
             message="#['[EXPERIENCE API] Order status request | OrderId: ' ++ (vars.orderId default 'unknown')]"
             doc:name="Log Status Request"/>
@@ -361,8 +368,7 @@ output application/json
         <flow-ref
             name="get-order-status-flow"
             doc:name="Get Order Status"/>
-
-        <error-handler>
+		<error-handler>
             <on-error-propagate type="ANY" doc:name="Status Error">
                 <set-variable
                     variableName="httpStatus"
@@ -433,10 +439,15 @@ output application/json
             doc:name="Set Correlation ID"/>
 
         <http:request
-            method="GET"
-            path="/analytics/metrics"
-            config-ref="Analytics_Request_Config"
-            doc:name="Fetch Analytics Metrics"/>
+		    method="GET"
+		    path="/api/analytics/metrics" 
+		    config-ref="Analytics_Request_Config"
+		    doc:name="Fetch Analytics Metrics">
+		    <http:headers>#[{
+		        "x-user-id": attributes.headers['x-user-id'] default "anonymous",
+		        "x-correlation-id": vars.correlationId
+		    }]</http:headers>
+		</http:request>
 
         <set-variable
             variableName="analyticsMetrics"
@@ -500,7 +511,8 @@ output application/json
         </when>
 
         <otherwise>
-            <set-variable
+            <set-variable value="#[attributes.headers['x-user-id'] default &quot;anonymous&quot;]" doc:name="Extract userId" doc:id="c7c0f33f-4a9e-4d91-b33e-2cf6b55700a4" variableName="userId" />
+				<set-variable
                 variableName="targetService"
                 value="#[attributes.uriParams.service default 'UNKNOWN']"
                 doc:name="Extract Service Name"/>

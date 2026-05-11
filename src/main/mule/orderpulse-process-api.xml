@@ -48,7 +48,8 @@ http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/htt
     doc:name="Fetch Customer from CRM">
     <http:headers>#[{
         "x-correlation-id": vars.correlationId,
-        "x-source-system": "orderpulse-process-api"
+        "x-source-system": "orderpulse-process-api",
+        "x-user-id": vars.userId default "anonymous"
     }]</http:headers>
     <http:uri-params>#[{ 
         customerId: vars.customerId 
@@ -214,7 +215,8 @@ http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/htt
     doc:name="Check Inventory in ERP">
     <http:headers>#[{
         "x-correlation-id": vars.correlationId,
-        "x-source-system": "orderpulse-process-api"
+        "x-source-system": "orderpulse-process-api",
+        "x-user-id": vars.userId default "anonymous"
     }]</http:headers>
     <http:uri-params>#[{ 
         sku: vars.orderSku 
@@ -290,7 +292,8 @@ output application/json
 }]</http:body>
                         <http:headers>#[{
                             "x-correlation-id": vars.correlationId,
-                            "x-source-system": "orderpulse-process-api"
+                            "x-source-system": "orderpulse-process-api",
+                            "x-user-id": vars.userId default "anonymous"
                         }]</http:headers>
                     </http:request>
 
@@ -376,6 +379,7 @@ output application/json
     routingPath: vars.routingPath,
     erpReservationId: vars.erpReservationId,
     complianceRequired: vars.complianceRequired default false,
+    userId: vars.userId default "anonymous",
     publishedAt: now() as String
 }]]]></amqp:body>
         <amqp:headers><![CDATA[#[{
@@ -396,10 +400,6 @@ output application/json
                     variableName="analyticsEventType"
                     value="ORDER_RECEIVED"
                     doc:name="Set Analytics Event"/>
-
-                <flow-ref
-                    name="track-analytics-flow"
-                    doc:name="Track Order Received"/>
 
                 <!-- ── STEP 10: Return 202 Accepted ─────────────── -->
                 <set-variable
@@ -617,6 +617,11 @@ if (payload is String) read(payload, 'application/json') else payload]"
             variableName="processingPriority"
             value="#[vars.queueMessage.priority default 'STANDARD']"
             doc:name="Restore Priority"/>
+            
+            <set-variable
+    variableName="userId"
+    value="#[vars.queueMessage.userId default 'anonymous']"
+    doc:name="Restore userId"/>
 
         <logger
             level="INFO"
@@ -655,7 +660,8 @@ output application/json
 }]</http:body>
     <http:headers>#[{
         "x-correlation-id": vars.correlationId default "unknown",
-        "x-source-system": "orderpulse-async-processor"
+        "x-source-system": "orderpulse-async-processor",
+        "x-user-id": vars.userId default "anonymous"
     }]</http:headers>
 </http:request>
 
@@ -728,7 +734,8 @@ output application/json
 }]</http:body>
         <http:headers>#[{
             "x-correlation-id": vars.correlationId default "unknown",
-            "x-source-system": "orderpulse-async-processor"
+            "x-source-system": "orderpulse-async-processor",
+            "x-user-id": vars.userId default "anonymous"
         }]</http:headers>
     </http:request>
 
@@ -789,12 +796,13 @@ output application/json
 ---
 {
     "x-correlation-id": vars.correlationId,
-    "x-source-system": "orderpulse-async-processor"
+    "x-source-system": "orderpulse-async-processor",
+    "x-user-id": vars.userId default "anonymous"
 }]]]></http:headers>
 			</http:request>
 			<set-variable
                 variableName="warehouseTicketId"
-                value="#[payload.data.ticketId]"
+                value="#[payload.data.fulfillmentId]"
                 doc:name="Store Warehouse Ticket ID"/>
 
             <logger
@@ -813,10 +821,12 @@ output application/json
 <amqp:publish
     config-ref="AMQP_Config"
     exchangeName="orderpulse.dlx"
-    routingKeys="${rabbitmq.queues.notifications}"
     doc:name="Queue Warehouse Notification Retry">
-    <amqp:message>
-        <amqp:body>#[%dw 2.0
+    <amqp:routing-keys >
+							<amqp:routing-key value="${rabbitmq.queues.notifications}" />
+						</amqp:routing-keys>
+						<amqp:message>
+        <amqp:body><![CDATA[#[%dw 2.0
             output application/json
             ---
             {
@@ -828,7 +838,7 @@ output application/json
                 priority: vars.processingPriority,
                 `type`: "WAREHOUSE_NOTIFICATION_RETRY",
                 queuedAt: now() as String
-            }]</amqp:body>
+            }]]]></amqp:body>
     </amqp:message>
 </amqp:publish>
 
@@ -917,16 +927,17 @@ output application/json
         <try doc:name="Try Get Warehouse Status">
 
 <http:request
-    method="GET"
     path="/warehouse/status/{orderId}"
     config-ref="Warehouse_Request_Config"
     doc:name="Get Warehouse Status">
-    <http:headers>#[{ 
-        "x-correlation-id": vars.correlationId 
-    }]</http:headers>
- <http:uri-params>#[{ 
+    <http:headers><![CDATA[#[{ 
+        "x-correlation-id": vars.correlationId,
+        "x-user-id": vars.userId
+      
+    }]]]></http:headers>
+ <http:uri-params><![CDATA[#[{ 
     orderId: trim(vars.orderId default "") 
-}]</http:uri-params>
+}]]]></http:uri-params>
 </http:request>
 
             <set-variable

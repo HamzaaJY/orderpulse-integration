@@ -30,7 +30,7 @@ http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/htt
             path="/analytics/track"
             config-ref="Analytics_Request_Config"
             doc:name="POST Track Event">
-            <http:body>#[%dw 2.0
+            <http:body><![CDATA[#[%dw 2.0
 output application/json
 ---
 {
@@ -47,12 +47,13 @@ output application/json
         processingPriority: vars.processingPriority default "STANDARD",
         correlationId: vars.correlationId default "unknown"
     }
-}]</http:body>
-            <http:headers>#[{
+}]]]></http:body>
+            <http:headers><![CDATA[#[{
                 "x-correlation-id": vars.correlationId default "unknown",
                 "x-source-system": "orderpulse-analytics-system-api",
+                "x-user-id": vars.userId default "anonymous",
                 "x-request-timestamp": now() as String
-            }]</http:headers>
+            }]]]></http:headers>
         </http:request>
 
         <logger
@@ -81,14 +82,14 @@ output application/json
             doc:name="Log Metrics Request"/>
 
         <http:request
-            method="GET"
             path="/analytics/metrics"
             config-ref="Analytics_Request_Config"
             doc:name="GET Metrics">
-            <http:headers>#[{
+            <http:headers><![CDATA[#[{
                 "x-correlation-id": vars.correlationId default uuid(),
-                "x-source-system": "orderpulse-analytics-system-api"
-            }]</http:headers>
+                "x-source-system": "orderpulse-analytics-system-api",
+                "x-user-id": vars.userId default "anonymous"
+            }]]]></http:headers>
         </http:request>
 
         <logger
@@ -128,17 +129,17 @@ output application/json
             doc:name="Log Events Request"/>
 
 <http:request
-    method="GET"
     path="/analytics/events/{orderId}"
     config-ref="Analytics_Request_Config"
     doc:name="GET Order Events">
-    <http:headers>#[{
+    <http:headers><![CDATA[#[{
         "x-correlation-id": vars.correlationId default "unknown",
-        "x-source-system": "orderpulse-analytics-system-api"
-    }]</http:headers>
-    <http:uri-params>#[{ 
+        "x-source-system": "orderpulse-analytics-system-api",
+        "x-user-id": vars.userId default "anonymous"
+    }]]]></http:headers>
+    <http:uri-params><![CDATA[#[{ 
         orderId: vars.orderId 
-    }]</http:uri-params>
+    }]]]></http:uri-params>
 </http:request>
 
         <logger
